@@ -50,17 +50,16 @@ jobs:
         continue-on-error: true
         run: |
           if [ ! -f state/CONFIRMED.txt ]; then
-            echo "[debug] SMTP_SENDER set? $([ -n "$SMTP_SENDER" ] && echo YES || echo NO)"
-            echo "[debug] SMTP_PASSWORD set? $([ -n "$SMTP_PASSWORD" ] && echo YES || echo NO)"
-            python - <<'PY'
-import os, smtplib, sys, traceback
+            cat > send_confirm.py <<'PY'
+import os, smtplib, traceback
 from email.message import EmailMessage
 try:
-    host=os.environ["SMTP_HOST"]; port=int(os.environ["SMTP_PORT"])
-    user=os.environ.get("SMTP_SENDER",""); pw=os.environ.get("SMTP_PASSWORD","")
-    to=os.environ.get("RECIPIENT_EMAIL","")
-    if not (user and pw and to):
-        raise RuntimeError(f"Missing env: user={bool(user)} pw={bool(pw)} to={bool(to)}")
+    host=os.environ.get("SMTP_HOST","smtp.gmail.com")
+    port=int(os.environ.get("SMTP_PORT","587"))
+    user=os.environ.get("SMTP_SENDER","")
+    pw  =os.environ.get("SMTP_PASSWORD","")
+    to  =os.environ.get("RECIPIENT_EMAIL","")
+    assert user and pw and to, f"missing env user={bool(user)} pw={bool(pw)} to={bool(to)}"
     msg=EmailMessage()
     msg["Subject"]="【滋賀プラザ】監視システム 起動確認（初回のみ）"
     msg["From"]=f"滋賀プラザ監視 <{user}>"
@@ -73,15 +72,15 @@ try:
     print("sent confirmation")
 except Exception as e:
     print("[warn] confirmation mail failed:", e)
-    traceback.print_exc(file=sys.stdout)
+    traceback.print_exc()
 PY
+            python send_confirm.py || true
             date -u +"%Y-%m-%dT%H:%M:%SZ" > state/CONFIRMED.txt
-            cd state
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add CONFIRMED.txt
-            git commit -m "chore(state): add confirmation marker" || true
-            git push origin state
+            git -C state config user.name "github-actions[bot]"
+            git -C state config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git -C state add CONFIRMED.txt
+            git -C state commit -m "chore(state): add confirmation marker" || true
+            git -C state push origin state
           else
             echo "[info] confirmation already sent (state/CONFIRMED.txt exists)"
           fi
