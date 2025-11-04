@@ -10,7 +10,7 @@ jobs:
   run:
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # stateブランチにDB/ハートビートをコミット
+      contents: write
     env:
       SMTP_HOST: smtp.gmail.com
       SMTP_PORT: "587"
@@ -33,6 +33,9 @@ jobs:
         run: |
           if [ -f state/shigaplaza.db ]; then
             cp state/shigaplaza.db ./shigaplaza.db
+            echo "[info] restored DB from state"
+          else
+            echo "[info] no DB in state"
           fi
 
       - name: Detect first run (no DB yet) -> set FORCE_MAIL=1

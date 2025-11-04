@@ -10,12 +10,12 @@ LISTS = [
     f"{BASE}/service/hojyokin-introduction/",
 ]
 DB = "shigaplaza.db"
-KEYWORDS = ["補助金", "支援金", "講座", "セミナー"]
+KEYWORDS = ["補助金", "支援金", "講座", "セミナー", "募集", "公募", "説明会"]
 
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-SMTP_SENDER = os.getenv("SMTP_SENDER")           # GitHub Secrets
-SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")       # GitHub Secrets
+SMTP_SENDER = os.getenv("SMTP_SENDER")
+SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL", "57180928miwa@gmail.com")
 
 UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) MonitorBot/1.0"
@@ -28,7 +28,7 @@ def init_db():
     )""")
     con.commit(); con.close()
 
-def sha(s):
+def sha(s): 
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 def get_soup(url):
@@ -45,7 +45,9 @@ def pick_articles_from_list(url):
             continue
         if href.startswith("/news/") or "/news/" in href:
             links.add(href if href.startswith("http") else BASE + href)
-    return sorted(links)
+    links = sorted(links)
+    print(f"[DEBUG] picked {len(links)} links from {url}")
+    return links
 
 def parse_detail(url):
     s = get_soup(url)
@@ -95,6 +97,7 @@ def send_mail(subject: str, body: str):
         s.send_message(msg)
 
 def main():
+    print(f"[DEBUG] FORCE_MAIL={os.getenv('FORCE_MAIL')!r}")
     init_db()
     new_count = 0
     for src in LISTS:
@@ -118,7 +121,8 @@ def main():
             time.sleep(2)
         except Exception as e:
             send_mail("【滋賀プラザ】監視失敗", f"URL: {src}\nError: {e}")
-    force = os.getenv("FORCE_MAIL","0")=="1"
+    # --- 初回（DBなし検知などでFORCE_MAIL=1）や手動強制時のテスト通知 ---
+    force = os.getenv("FORCE_MAIL", "0") == "1"
     if new_count == 0 and force:
         send_mail("【滋賀プラザ】テスト通知", "新着0件でしたが、通知経路の確認メールです。")
     print(f"done. new={new_count}")
