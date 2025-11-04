@@ -45,11 +45,10 @@ jobs:
       - name: Install deps
         run: pip install requests beautifulsoup4 lxml
 
-      # —— 確認メール（1回限り）。失敗してもジョブ継続 ——
+      # —— 初回確認メール（1回限り）| 失敗しても続行 ——
       - name: One-time confirmation mail if not yet sent
         continue-on-error: true
         run: |
-          set -e
           if [ ! -f state/CONFIRMED.txt ]; then
             echo "[debug] SMTP_SENDER set? $([ -n "$SMTP_SENDER" ] && echo YES || echo NO)"
             echo "[debug] SMTP_PASSWORD set? $([ -n "$SMTP_PASSWORD" ] && echo YES || echo NO)"
