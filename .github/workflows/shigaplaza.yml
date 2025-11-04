@@ -38,26 +38,43 @@ jobs:
             echo "[info] no DB in state"
           fi
 
-      # —— 新規：初回確認メール（1回限り）——
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - name: Install deps
+        run: pip install requests beautifulsoup4 lxml
+
+      # —— 確認メール（1回限り）。失敗してもジョブ継続 ——
       - name: One-time confirmation mail if not yet sent
+        continue-on-error: true
         run: |
+          set -e
           if [ ! -f state/CONFIRMED.txt ]; then
+            echo "[debug] SMTP_SENDER set? $([ -n "$SMTP_SENDER" ] && echo YES || echo NO)"
+            echo "[debug] SMTP_PASSWORD set? $([ -n "$SMTP_PASSWORD" ] && echo YES || echo NO)"
             python - <<'PY'
-import os, smtplib
+import os, smtplib, sys, traceback
 from email.message import EmailMessage
-host=os.environ["SMTP_HOST"]; port=int(os.environ["SMTP_PORT"])
-user=os.environ["SMTP_SENDER"]; pw=os.environ["SMTP_PASSWORD"]
-to=os.environ["RECIPIENT_EMAIL"]
-msg=EmailMessage()
-msg["Subject"]="【滋賀プラザ】監視システム 起動確認（初回のみ）"
-msg["From"]=f"滋賀プラザ監視 <{user}>"
-msg["To"]=to
-msg.set_content("監視ジョブが起動しました（初回のみ送信）。以降は新着/更新があった時だけ届きます。")
-with smtplib.SMTP(host, port, timeout=20) as s:
-    s.ehlo(); s.starttls(); s.ehlo()
-    s.login(user, pw)
-    s.send_message(msg)
-print("sent confirmation")
+try:
+    host=os.environ["SMTP_HOST"]; port=int(os.environ["SMTP_PORT"])
+    user=os.environ.get("SMTP_SENDER",""); pw=os.environ.get("SMTP_PASSWORD","")
+    to=os.environ.get("RECIPIENT_EMAIL","")
+    if not (user and pw and to):
+        raise RuntimeError(f"Missing env: user={bool(user)} pw={bool(pw)} to={bool(to)}")
+    msg=EmailMessage()
+    msg["Subject"]="【滋賀プラザ】監視システム 起動確認（初回のみ）"
+    msg["From"]=f"滋賀プラザ監視 <{user}>"
+    msg["To"]=to
+    msg.set_content("監視ジョブが起動しました（初回のみ送信）。以降は新着/更新があった時だけ届きます。")
+    with smtplib.SMTP(host, port, timeout=20) as s:
+        s.ehlo(); s.starttls(); s.ehlo()
+        s.login(user, pw)
+        s.send_message(msg)
+    print("sent confirmation")
+except Exception as e:
+    print("[warn] confirmation mail failed:", e)
+    traceback.print_exc(file=sys.stdout)
 PY
             date -u +"%Y-%m-%dT%H:%M:%SZ" > state/CONFIRMED.txt
             cd state
@@ -69,13 +86,6 @@ PY
           else
             echo "[info] confirmation already sent (state/CONFIRMED.txt exists)"
           fi
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with: { python-version: "3.11" }
-
-      - name: Install deps
-        run: pip install requests beautifulsoup4 lxml
 
       - name: Run monitor
         run: python monitor_shigaplaza.py
