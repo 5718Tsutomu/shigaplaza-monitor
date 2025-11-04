@@ -38,11 +38,36 @@ jobs:
             echo "[info] no DB in state"
           fi
 
-      - name: Detect first run (no DB yet) -> set FORCE_MAIL=1
+      # —— ここが新規：初回確認メール（1回限り）——
+      - name: One-time confirmation mail if not yet sent
         run: |
-          if [ ! -f ./shigaplaza.db ]; then
-            echo "FORCE_MAIL=1" >> $GITHUB_ENV
-            echo "[info] first run detected -> FORCE_MAIL=1"
+          if [ ! -f state/CONFIRMED.txt ]; then
+            python - <<'PY'
+import os, smtplib
+from email.message import EmailMessage
+host=os.environ["SMTP_HOST"]; port=int(os.environ["SMTP_PORT"])
+user=os.environ["SMTP_SENDER"]; pw=os.environ["SMTP_PASSWORD"]
+to=os.environ["RECIPIENT_EMAIL"]
+msg=EmailMessage()
+msg["Subject"]="【滋賀プラザ】監視システム 起動確認（初回のみ）"
+msg["From"]=f"滋賀プラザ監視 <{user}>"
+msg["To"]=to
+msg.set_content("監視ジョブが起動しました（初回のみ送信）。以降は新着/更新があった時だけ届きます。")
+with smtplib.SMTP(host, port, timeout=20) as s:
+    s.ehlo(); s.starttls(); s.ehlo()
+    s.login(user, pw)
+    s.send_message(msg)
+print("sent confirmation")
+PY
+            date -u +"%Y-%m-%dT%H:%M:%SZ" > state/CONFIRMED.txt
+            cd state
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add CONFIRMED.txt
+            git commit -m "chore(state): add confirmation marker" || true
+            git push origin state
+          else
+            echo "[info] confirmation already sent (state/CONFIRMED.txt exists)"
           fi
 
       - name: Setup Python
@@ -54,8 +79,6 @@ jobs:
 
       - name: Run monitor
         run: python monitor_shigaplaza.py
-        env:
-          FORCE_MAIL: ${{ env.FORCE_MAIL }}
 
       - name: Save DB back to state branch if changed
         run: |
