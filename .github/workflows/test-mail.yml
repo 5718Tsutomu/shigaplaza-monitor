@@ -1,0 +1,33 @@
+name: test-mail
+on: { workflow_dispatch: {} }
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    env:
+      SMTP_HOST: smtp.gmail.com
+      SMTP_PORT: "587"
+      SMTP_SENDER: ${{ secrets.SMTP_SENDER }}
+      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+      RECIPIENT_EMAIL: "57180928miwa@gmail.com"
+    steps:
+      - name: Send test email
+        run: |
+          python - <<'PY'
+          import os, smtplib
+          from email.message import EmailMessage
+          host=os.environ["SMTP_HOST"]; port=int(os.environ["SMTP_PORT"])
+          user=os.environ["SMTP_SENDER"]; pw=os.environ["SMTP_PASSWORD"]
+          to=os.environ["RECIPIENT_EMAIL"]
+          if not user or not pw:
+              raise SystemExit("Secrets missing: SMTP_SENDER/SMTP_PASSWORD")
+          msg=EmailMessage()
+          msg["Subject"]="【テスト】SMTP送信確認（GitHub Actions）"
+          msg["From"]=f"滋賀プラザ監視 <{user}>"
+          msg["To"]=to
+          msg.set_content("このメールが届けばSMTP設定はOKです。")
+          with smtplib.SMTP(host, port, timeout=20) as s:
+              s.ehlo(); s.starttls(); s.ehlo()
+              s.login(user, pw)   # ここで不正ならエラーでジョブ失敗
+              s.send_message(msg)
+          print("sent ok")
+          PY
