@@ -38,6 +38,22 @@ jobs:
             echo "[info] no DB in state"
           fi
 
+      # 初回確認メールは monitor 側の FORCE_MAIL で送る
+      - name: One-time confirmation marker -> set FORCE_MAIL=1
+        run: |
+          if [ ! -f state/CONFIRMED.txt ]; then
+            echo "FORCE_MAIL=1" >> "$GITHUB_ENV"
+            date -u +"%Y-%m-%dT%H:%M:%SZ" > state/CONFIRMED.txt
+            git -C state config user.name "github-actions[bot]"
+            git -C state config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git -C state add CONFIRMED.txt
+            git -C state commit -m "chore(state): add confirmation marker" || true
+            git -C state push origin state
+            echo "[info] set FORCE_MAIL=1 for first-run confirmation"
+          else
+            echo "[info] confirmation already sent (marker exists)"
+          fi
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with: { python-version: "3.11" }
@@ -45,48 +61,10 @@ jobs:
       - name: Install deps
         run: pip install requests beautifulsoup4 lxml
 
-      # —— 初回確認メール（1回限り）| 失敗しても続行 ——
-      - name: One-time confirmation mail if not yet sent
-        continue-on-error: true
-        run: |
-          if [ ! -f state/CONFIRMED.txt ]; then
-            cat > send_confirm.py <<'PY'
-import os, smtplib, traceback
-from email.message import EmailMessage
-try:
-    host=os.environ.get("SMTP_HOST","smtp.gmail.com")
-    port=int(os.environ.get("SMTP_PORT","587"))
-    user=os.environ.get("SMTP_SENDER","")
-    pw  =os.environ.get("SMTP_PASSWORD","")
-    to  =os.environ.get("RECIPIENT_EMAIL","")
-    assert user and pw and to, f"missing env user={bool(user)} pw={bool(pw)} to={bool(to)}"
-    msg=EmailMessage()
-    msg["Subject"]="【滋賀プラザ】監視システム 起動確認（初回のみ）"
-    msg["From"]=f"滋賀プラザ監視 <{user}>"
-    msg["To"]=to
-    msg.set_content("監視ジョブが起動しました（初回のみ送信）。以降は新着/更新があった時だけ届きます。")
-    with smtplib.SMTP(host, port, timeout=20) as s:
-        s.ehlo(); s.starttls(); s.ehlo()
-        s.login(user, pw)
-        s.send_message(msg)
-    print("sent confirmation")
-except Exception as e:
-    print("[warn] confirmation mail failed:", e)
-    traceback.print_exc()
-PY
-            python send_confirm.py || true
-            date -u +"%Y-%m-%dT%H:%M:%SZ" > state/CONFIRMED.txt
-            git -C state config user.name "github-actions[bot]"
-            git -C state config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git -C state add CONFIRMED.txt
-            git -C state commit -m "chore(state): add confirmation marker" || true
-            git -C state push origin state
-          else
-            echo "[info] confirmation already sent (state/CONFIRMED.txt exists)"
-          fi
-
       - name: Run monitor
         run: python monitor_shigaplaza.py
+        env:
+          FORCE_MAIL: ${{ env.FORCE_MAIL }}
 
       - name: Save DB back to state branch if changed
         run: |
