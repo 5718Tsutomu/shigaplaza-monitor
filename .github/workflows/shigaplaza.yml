@@ -1,0 +1,60 @@
+name: shigaplaza-monitor
+
+on:
+  schedule:
+    - cron: "0,30 * * * *"   # 30分おき（UTC）
+  workflow_dispatch: {}
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # stateブランチにDBをコミットするため
+    env:
+      SMTP_HOST: smtp.gmail.com
+      SMTP_PORT: "587"
+      SMTP_SENDER: ${{ secrets.SMTP_SENDER }}
+      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+      RECIPIENT_EMAIL: "57180928miwa@gmail.com"
+
+    steps:
+      - name: Checkout code (main)
+        uses: actions/checkout@v4
+        with: { ref: main }
+
+      - name: Checkout state branch
+        uses: actions/checkout@v4
+        with:
+          ref: state
+          path: state
+
+      - name: Restore DB from state branch (if exists)
+        run: |
+          if [ -f state/shigaplaza.db ]; then
+            cp state/shigaplaza.db ./shigaplaza.db
+          fi
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+
+      - name: Install deps
+        run: pip install requests beautifulsoup4 lxml
+
+      - name: Run monitor
+        run: python monitor_shigaplaza.py
+
+      - name: Save DB back to state branch if changed
+        run: |
+          mkdir -p state
+          if [ -f ./shigaplaza.db ]; then
+            if [ ! -f state/shigaplaza.db ] || ! cmp -s ./shigaplaza.db state/shigaplaza.db; then
+              cp ./shigaplaza.db state/shigaplaza.db
+              cd state
+              git config user.name "github-actions[bot]"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git add shigaplaza.db
+              git commit -m "chore(state): update DB" || true
+              git push origin state
+            fi
+          fi
