@@ -118,6 +118,9 @@ def main():
             time.sleep(2)
         except Exception as e:
             send_mail("【滋賀プラザ】監視失敗", f"URL: {src}\nError: {e}")
+    force = os.getenv("FORCE_MAIL","0")=="1"
+    if new_count == 0 and force:
+        send_mail("【滋賀プラザ】テスト通知", "新着0件でしたが、通知経路の確認メールです。")
     print(f"done. new={new_count}")
 
 if __name__ == "__main__":

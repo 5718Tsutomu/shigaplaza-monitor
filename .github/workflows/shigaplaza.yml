@@ -2,14 +2,15 @@ name: shigaplaza-monitor
 
 on:
   schedule:
-    - cron: "0,30 * * * *"   # 30分おき（UTC）
+    - cron: "0,30 * * * *"    # 30分おき
+    - cron: "12 0 1 * *"      # 毎月1日 00:12 UTCにハートビート
   workflow_dispatch: {}
 
 jobs:
   run:
     runs-on: ubuntu-latest
     permissions:
-      contents: write   # stateブランチにDBをコミットするため
+      contents: write   # stateブランチにDB/ハートビートをコミット
     env:
       SMTP_HOST: smtp.gmail.com
       SMTP_PORT: "587"
@@ -34,6 +35,13 @@ jobs:
             cp state/shigaplaza.db ./shigaplaza.db
           fi
 
+      - name: Detect first run (no DB yet) -> set FORCE_MAIL=1
+        run: |
+          if [ ! -f ./shigaplaza.db ]; then
+            echo "FORCE_MAIL=1" >> $GITHUB_ENV
+            echo "[info] first run detected -> FORCE_MAIL=1"
+          fi
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with: { python-version: "3.11" }
@@ -43,6 +51,8 @@ jobs:
 
       - name: Run monitor
         run: python monitor_shigaplaza.py
+        env:
+          FORCE_MAIL: ${{ env.FORCE_MAIL }}
 
       - name: Save DB back to state branch if changed
         run: |
@@ -58,3 +68,15 @@ jobs:
               git push origin state
             fi
           fi
+
+      - name: Monthly heartbeat commit (only on 12 0 1 * * schedule)
+        if: github.event.schedule == '12 0 1 * *'
+        run: |
+          mkdir -p state
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > state/HEARTBEAT.txt
+          cd state
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add HEARTBEAT.txt
+          git commit -m "chore(state): monthly heartbeat" || true
+          git push origin state
