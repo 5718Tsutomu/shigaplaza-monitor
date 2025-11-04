@@ -38,7 +38,7 @@ jobs:
             echo "[info] no DB in state"
           fi
 
-      # —— ここが新規：初回確認メール（1回限り）——
+      # —— 新規：初回確認メール（1回限り）——
       - name: One-time confirmation mail if not yet sent
         run: |
           if [ ! -f state/CONFIRMED.txt ]; then
