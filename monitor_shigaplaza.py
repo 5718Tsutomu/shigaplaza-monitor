@@ -13,22 +13,26 @@ SITE_RULES = {
         ],
         # 記事候補リンク（部分一致）
         "detail_patterns": [r"/news/"],
+        # 更新も通知（従来どおり）
+        "brand_new_only": False,
     },
     "www.kstcci.or.jp": {
         "list_urls": [
-            # 必要に応じて個別一覧URLを追加可能
+            # トップも辿って /news/ へのリンクを拾う（保険）
             "https://www.kstcci.or.jp/",
+            # もしニュース一覧が /news/ で公開されていれば、ここで直接巡回
+            "https://www.kstcci.or.jp/news/",
         ],
-        # 記事候補リンク（部分一致・広め）
-        "detail_patterns": [
-            r"/news", r"/seminar", r"/event", r"/kouza", r"/info",
-            r"/subsidy", r"/support", r"/hojokin", r"/hojyokin", r"/oshirase",
-        ],
+        # ★ニュース限定：/news/ のみ許可
+        "detail_patterns": [r"/news/"],
+        # ★新規のみ通知（更新では再通知しない）
+        "brand_new_only": True,
     },
 }
 
 # === 通知判定用キーワード（タイトル/本文のどちらかに含まれれば通知） ===
-KEYWORDS = ["補助金", "支援金", "講座", "セミナー", "募集", "公募", "説明会"]
+# ★ご指定に合わせて絞り込み
+KEYWORDS = ["補助金", "支援金", "講座"]
 
 DB = "shigaplaza.db"
 
@@ -38,7 +42,7 @@ SMTP_SENDER = os.getenv("SMTP_SENDER")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL", "57180928miwa@gmail.com")
 
-UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) MonitorBot/1.1"
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) MonitorBot/1.2"
 
 def init_db():
     con = sqlite3.connect(DB)
@@ -56,8 +60,11 @@ def get_soup(url):
     r.raise_for_status()
     return BeautifulSoup(r.text, "lxml")
 
+def host_of(url):
+    return urllib.parse.urlparse(url).netloc
+
 def same_host(url, host):
-    return urllib.parse.urlparse(url).netloc == host
+    return host_of(url) == host
 
 def norm_url(base, href):
     href = (href or "").strip()
@@ -86,7 +93,7 @@ def pick_articles_from_list(list_url, host, patterns):
             links.add(u)
     links = sorted(links)
     print(f"[DEBUG] {host}: picked {len(links)} links from {list_url}")
-    # リストページがトップのとき等、リンクが多過ぎるのを防ぐ
+    # 多すぎる場合の安全弁
     return links[:200]
 
 def parse_detail(url):
@@ -108,11 +115,18 @@ def parse_detail(url):
     updated   = find_date("最終更新") or find_date("更新日")
     hit = any(k in title or k in text for k in KEYWORDS)
 
-    # URL + 更新日(なければ公開日) で一意IDを作る ⇒ 更新も新着扱い
-    basis = url + "|" + (updated or published)
-    item_id = sha(basis or url)
+    return dict(url=url, title=title, published=published, updated=updated, hit=hit)
 
-    return dict(id=item_id, url=url, title=title, published=published, updated=updated, hit=hit)
+def make_item_id(url, updated, published, rule):
+    """
+    一意IDの作り方：
+      - brand_new_only=True のサイト（kstcci）は URL のみ（更新では再通知しない）
+      - それ以外は URL + (更新日 or 公開日)（更新も通知対象）
+    """
+    if rule.get("brand_new_only", False):
+        return sha(url)
+    basis = url + "|" + (updated or published)
+    return sha(basis or url)
 
 def known(item_id):
     con = sqlite3.connect(DB); cur = con.cursor()
@@ -133,7 +147,7 @@ def send_mail(subject: str, body: str):
         return
     msg = EmailMessage()
     msg["Subject"] = subject
-    msg["From"] = f"滋賀プラザ監視 <{SMTP_SENDER}>"
+    msg["From"] = f"サイト監視 <{SMTP_SENDER}>"
     msg["To"] = RECIPIENT_EMAIL
     msg.set_content(body)
 
@@ -155,10 +169,13 @@ def main():
                     d = parse_detail(url)
                     if not d["hit"]:
                         continue
-                    if known(d["id"]):
+                    # 一意IDの生成（サイトごとの方針に従う）
+                    item_id = make_item_id(d["url"], d["updated"], d["published"], rule)
+                    if known(item_id):
                         continue
-                    save(d, src); new_count += 1
-                    subject = f"【入手】新着/更新: {d['title']}"
+                    # 保存＆通知
+                    save({"id": item_id, **d}, src); new_count += 1
+                    subject = f"【新着】{d['title']}"
                     body = (
                         f"タイトル：{d['title']}\n"
                         f"公開日：{d['published'] or '—'} / 最終更新：{d['updated'] or '—'}\n"
