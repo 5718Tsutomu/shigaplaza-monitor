@@ -92,3 +92,4 @@ jobs:
           git add HEARTBEAT.txt
           git commit -m "chore(state): monthly heartbeat" || true
           git push origin state
+          FORCE_SAMPLE: ${{ vars.FORCE_SAMPLE }}
