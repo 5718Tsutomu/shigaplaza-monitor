@@ -17,23 +17,24 @@ SITE_RULES = {
         "brand_new_only": False,      # ←従来どおり：更新も通知
         "index_extract": False,
         "allow_external": False,
+        "title_only": False,          # ←従来どおり：本文ヒットもOK
     },
     "www.kstcci.or.jp": {
-        # ★修正点：/news を“一覧ページ”として扱い、そこから個別記事URLを抽出
+        # /news（＋/news/page/...）を一覧とみなし、そこから個別記事URLを抽出
         "list_urls": [
             "https://www.kstcci.or.jp/news/",
         ],
-        # ★個別記事URLのパターン（例：/notice/post6799, /news/post6801 など）
+        # 個別記事URLのパターン（例：/notice/post6799, /news/post6801 など）
         "detail_patterns": [r"^/(news|notice)/post\d+/?$"],
-        # ★ページネーションは一覧扱いにするので、ここでは除外不要（index_extractで処理）
         "exclude_patterns": [],
         "brand_new_only": True,       # 新規のみ通知（URL単位）
         "index_extract": True,        # 一覧から個別記事リンクを抽出
         "allow_external": False,      # 外部リンクは拾わない（kstcci内のみ）
+        "title_only": True,           # ★タイトルにキーワードを含む場合のみ通知
     },
 }
 
-# === キーワード（タイトル/本文に含まれればヒット） ===
+# === キーワード ===
 KEYWORDS = ["補助金", "支援金", "講座"]
 
 DB = "shigaplaza.db"
@@ -44,7 +45,7 @@ SMTP_SENDER = os.getenv("SMTP_SENDER")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL", "57180928miwa@gmail.com")
 
-UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) MonitorBot/1.6"
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) MonitorBot/1.7"
 
 def init_db():
     con = sqlite3.connect(DB)
@@ -88,11 +89,7 @@ def any_match(patterns, path):
     return any(re.search(p, path) for p in patterns)
 
 def pick_articles_from_list(list_url, rule):
-    """
-    既定：同一ホスト内で detail_patterns に合うリンクを拾う。
-    kstcci は index_extract=True のため、/news（および /news/page/…）を“一覧”とみなし、
-    その中の個別記事リンク（/notice/postNNNN or /news/postNNNN）だけを抽出する。
-    """
+    """一覧ページから記事URLを抽出（kstcciは/news配下の一覧→個別記事URL抽出）。"""
     host = host_of(list_url)
     soup = get_soup(list_url)
     links = set()
@@ -100,7 +97,6 @@ def pick_articles_from_list(list_url, rule):
     # --- kstcci の一覧抽出 ---
     if rule.get("index_extract", False) and host == "www.kstcci.or.jp":
         p = path_of(list_url)
-        # /news と /news/page/N ... を一覧とみなす
         if re.match(r"^/news(/page/\d+)?/?$", p):
             for a in soup.select("a[href]"):
                 u = norm_url(list_url, a.get("href"))
@@ -109,7 +105,6 @@ def pick_articles_from_list(list_url, rule):
                 if not same_host(u, host):
                     continue
                 path = path_of(u).lower()
-                # 個別記事だけ拾う
                 if any_match(rule["detail_patterns"], path):
                     links.add(u)
             picked = sorted(links)
@@ -133,7 +128,7 @@ def pick_articles_from_list(list_url, rule):
     print(f"[DEBUG] {host}: picked {len(picked)} links from {list_url}")
     return picked[:200]
 
-def parse_detail(url):
+def parse_detail(url, rule):
     s = get_soup(url)
     t = s.select_one("h1")
     title = (t.get_text(strip=True) if t else (s.title.get_text(strip=True) if s.title else url))
@@ -148,7 +143,13 @@ def parse_detail(url):
 
     published = find_date("公開日")
     updated   = find_date("最終更新") or find_date("更新日")
-    hit = any(k in title or k in text for k in KEYWORDS)
+
+    # ★ヒット条件：サイトごとに切替
+    if rule.get("title_only", False):
+        hit = any(k in title for k in KEYWORDS)  # タイトルのみ
+    else:
+        hit = any(k in title or k in text for k in KEYWORDS)  # タイトルor本文（従来）
+
     return dict(url=url, title=title, published=published, updated=updated, hit=hit)
 
 def make_item_id(url, updated, published, rule):
@@ -217,7 +218,7 @@ def pick_latest_matching(host: str, rule: dict):
     for src in rule["list_urls"]:
         try:
             for url in pick_articles_from_list(src, rule):
-                d = parse_detail(url)
+                d = parse_detail(url, rule)
                 if d["hit"]:
                     candidates.append((src, d))
             time.sleep(1)
@@ -267,7 +268,7 @@ def main():
         for src in rule["list_urls"]:
             try:
                 for url in pick_articles_from_list(src, rule):
-                    d = parse_detail(url)
+                    d = parse_detail(url, rule)
                     if not d["hit"]:
                         continue
                     item_id = make_item_id(d["url"], d["updated"], d["published"], rule)
