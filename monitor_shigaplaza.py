@@ -11,27 +11,23 @@ SITE_RULES = {
             "https://www.shigaplaza.or.jp/service/support/subsidy/",
             "https://www.shigaplaza.or.jp/service/hojyokin-introduction/",
         ],
-        # 記事候補リンク（部分一致）
         "detail_patterns": [r"/news/"],
-        # 更新も通知（従来どおり）
-        "brand_new_only": False,
+        "brand_new_only": False,   # 更新も通知（従来どおり）
+        "news_only": True,
     },
     "www.kstcci.or.jp": {
         "list_urls": [
-            # トップも辿って /news/ へのリンクを拾う（保険）
             "https://www.kstcci.or.jp/",
-            # もしニュース一覧が /news/ で公開されていれば、ここで直接巡回
             "https://www.kstcci.or.jp/news/",
         ],
-        # ★ニュース限定：/news/ のみ許可
-        "detail_patterns": [r"/news/"],
-        # ★新規のみ通知（更新では再通知しない）
-        "brand_new_only": True,
+        "detail_patterns": [r"/news/"],  # ★ニュース限定
+        "brand_new_only": True,          # ★新規のみ（更新では再通知しない）
+        "news_only": True,
     },
 }
 
 # === 通知判定用キーワード（タイトル/本文のどちらかに含まれれば通知） ===
-# ★ご指定に合わせて絞り込み
+# kstcciのご要望に合わせ、全体のキーワードも絞り込み
 KEYWORDS = ["補助金", "支援金", "講座"]
 
 DB = "shigaplaza.db"
@@ -42,7 +38,7 @@ SMTP_SENDER = os.getenv("SMTP_SENDER")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL", "57180928miwa@gmail.com")
 
-UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) MonitorBot/1.2"
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) MonitorBot/1.3"
 
 def init_db():
     con = sqlite3.connect(DB)
@@ -77,9 +73,6 @@ def norm_url(base, href):
     return u
 
 def pick_articles_from_list(list_url, host, patterns):
-    """
-    一覧URLを開き、同一ホスト内で patterns のいずれかを含むリンクを記事候補として返す。
-    """
     soup = get_soup(list_url)
     links = set()
     for a in soup.select("a[href]"):
@@ -93,7 +86,6 @@ def pick_articles_from_list(list_url, host, patterns):
             links.add(u)
     links = sorted(links)
     print(f"[DEBUG] {host}: picked {len(links)} links from {list_url}")
-    # 多すぎる場合の安全弁
     return links[:200]
 
 def parse_detail(url):
@@ -103,7 +95,6 @@ def parse_detail(url):
     text = s.get_text(" ", strip=True)
 
     def find_date(label):
-        # 例：「公開日：2024.05.01」「最終更新 2024/05/01」「2024年5月1日」等
         m = re.search(label + r"\s*[:：]?\s*([0-9]{4}[./年][01]?\d[./月][0-3]?\d)", text)
         if m:
             raw = m.group(1).replace("年", ".").replace("月", ".").replace("日", "")
@@ -118,11 +109,7 @@ def parse_detail(url):
     return dict(url=url, title=title, published=published, updated=updated, hit=hit)
 
 def make_item_id(url, updated, published, rule):
-    """
-    一意IDの作り方：
-      - brand_new_only=True のサイト（kstcci）は URL のみ（更新では再通知しない）
-      - それ以外は URL + (更新日 or 公開日)（更新も通知対象）
-    """
+    # brand_new_only=True のサイトは URL のみでID化（更新では再通知しない）
     if rule.get("brand_new_only", False):
         return sha(url)
     basis = url + "|" + (updated or published)
@@ -156,25 +143,45 @@ def send_mail(subject: str, body: str):
         s.login(SMTP_SENDER, SMTP_PASSWORD)
         s.send_message(msg)
 
+def host_seeded(host: str) -> bool:
+    """そのホストの既存記事がDBに一度でも入っていれば True。無ければ初回シード対象。"""
+    prefix = f"https://{host}/"
+    con = sqlite3.connect(DB); cur = con.cursor()
+    cur.execute("SELECT 1 FROM items WHERE url LIKE ? OR src LIKE ? LIMIT 1", (prefix + "%", prefix + "%"))
+    ok = cur.fetchone() is not None
+    con.close()
+    return ok
+
 def main():
     print(f"[DEBUG] FORCE_MAIL={os.getenv('FORCE_MAIL')!r}")
     init_db()
-    new_count = 0
+    total_new = 0
 
     # 各ドメインごとに巡回
     for host, rule in SITE_RULES.items():
+        is_seed = not host_seeded(host) and os.getenv("FORCE_SEED", "1") == "1"
+        if is_seed:
+            print(f"[INFO] First-time silent seed for {host} (register existing items WITHOUT emailing)")
+
         for src in rule["list_urls"]:
             try:
                 for url in pick_articles_from_list(src, host, rule["detail_patterns"]):
                     d = parse_detail(url)
                     if not d["hit"]:
                         continue
-                    # 一意IDの生成（サイトごとの方針に従う）
+
                     item_id = make_item_id(d["url"], d["updated"], d["published"], rule)
                     if known(item_id):
                         continue
-                    # 保存＆通知
-                    save({"id": item_id, **d}, src); new_count += 1
+
+                    # --- 初回シード：保存のみ（通知しない） ---
+                    if is_seed:
+                        save({"id": item_id, **d}, src)
+                        continue
+
+                    # --- 通常運転：保存して通知 ---
+                    save({"id": item_id, **d}, src)
+                    total_new += 1
                     subject = f"【新着】{d['title']}"
                     body = (
                         f"タイトル：{d['title']}\n"
@@ -188,11 +195,12 @@ def main():
             except Exception as e:
                 send_mail("【監視失敗】サイト取得エラー", f"HOST: {host}\nSRC: {src}\nError: {e}")
 
-    # FORCE_MAIL=1（初回など）は新着0でもテスト通知
+    # 初回（seed）ランの終了通知は不要。FORCE_MAIL は既存の確認用途。
     force = os.getenv("FORCE_MAIL", "0") == "1"
-    if new_count == 0 and force:
+    if total_new == 0 and force:
         send_mail("【監視テスト】通知経路の確認", "新着0件でしたが、通知経路の確認メールです。")
-    print(f"done. new={new_count}")
+
+    print(f"done. new={total_new}")
 
 if __name__ == "__main__":
     main()
