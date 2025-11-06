@@ -10,6 +10,10 @@ on:
         description: "Send ONE sample email per host from existing latest matching news?"
         type: boolean
         default: false
+      reset_samples:
+        description: "Reset 'sample sent' flags before run?"
+        type: boolean
+        default: false
 
 jobs:
   run:
@@ -31,8 +35,8 @@ jobs:
       - name: Checkout state branch
         uses: actions/checkout@v4
         with:
-            ref: state
-            path: state
+          ref: state
+          path: state
 
       - name: Restore DB from state branch (if exists)
         run: |
@@ -43,8 +47,7 @@ jobs:
             echo "[info] no DB in state"
           fi
 
-      # 初回確認メールは既存の仕組みを維持
-      - name: One-time confirmation marker -> set FORCE_MAIL=1
+      - name: One-time confirmation marker -> set FORCE_MAIL=1 (first run only)
         run: |
           if [ ! -f state/CONFIRMED.txt ]; then
             echo "FORCE_MAIL=1" >> "$GITHUB_ENV"
@@ -59,6 +62,21 @@ jobs:
             echo "[info] confirmation already sent (marker exists)"
           fi
 
+      # ---- ここで “サンプル送信済みフラグ” をリセット可能（UIトグル） ----
+      - name: Reset sample flags (optional)
+        if: ${{ github.event.inputs.reset_samples == 'true' }}
+        run: |
+          sudo apt-get update && sudo apt-get install -y sqlite3
+          if [ -f ./shigaplaza.db ]; then
+            echo "[info] before reset:"
+            sqlite3 ./shigaplaza.db 'SELECT host, sent_at FROM samples;'
+            sqlite3 ./shigaplaza.db 'DELETE FROM samples;'
+            echo "[info] after reset:"
+            sqlite3 ./shigaplaza.db 'SELECT host, sent_at FROM samples;'
+          else
+            echo "[info] DB not found; nothing to reset"
+          fi
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with: { python-version: "3.11" }
@@ -70,8 +88,9 @@ jobs:
         run: python monitor_shigaplaza.py
         env:
           FORCE_MAIL: ${{ env.FORCE_MAIL }}
-          # checkbox の真偽値（"true"/"false"）をそのまま渡す → スクリプト側で true/yes/1 判定
           FORCE_SAMPLE: ${{ github.event.inputs.force_sample }}
+          # 必要なら大量送信テスト用に一時的に "0" にする（通常は触らない）
+          # FORCE_SEED: "0"
 
       - name: Save DB back to state branch if changed
         run: |
