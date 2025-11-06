@@ -2,6 +2,7 @@
 import os, re, hashlib, time, sqlite3, requests, smtplib, urllib.parse
 from email.message import EmailMessage
 from bs4 import BeautifulSoup
+from datetime import datetime
 
 # === 監視対象 ===
 SITE_RULES = {
@@ -12,29 +13,27 @@ SITE_RULES = {
             "https://www.shigaplaza.or.jp/service/hojyokin-introduction/",
         ],
         "detail_patterns": [r"/news/"],
-        "exclude_patterns": [],          # 除外なし
-        "brand_new_only": False,         # 更新も通知（従来どおり）
-        "index_extract": False,          # 一覧からの特別抽出なし
-        "allow_external": False,         # 外部リンクは原則対象外
+        "exclude_patterns": [],
+        "brand_new_only": False,      # ←従来どおり：更新も通知
+        "index_extract": False,
+        "allow_external": False,
     },
     "www.kstcci.or.jp": {
+        # ★修正点：/news を“一覧ページ”として扱い、そこから個別記事URLを抽出
         "list_urls": [
-            "https://www.kstcci.or.jp/",
             "https://www.kstcci.or.jp/news/",
         ],
-        # ★ニュースのみ
-        "detail_patterns": [r"^/news/"],
-        # ★ページネーション (/news/page/5 など) は“記事として”除外
-        "exclude_patterns": [r"^/news/page/\d+/?$"],
-        # ★“新規のみ”通知（URL単位）
-        "brand_new_only": True,
-        # ★一覧ページから、キーワードを含む個別記事のリンクを抽出（外部リンクも許可）
-        "index_extract": True,
-        "allow_external": True,
+        # ★個別記事URLのパターン（例：/notice/post6799, /news/post6801 など）
+        "detail_patterns": [r"^/(news|notice)/post\d+/?$"],
+        # ★ページネーションは一覧扱いにするので、ここでは除外不要（index_extractで処理）
+        "exclude_patterns": [],
+        "brand_new_only": True,       # 新規のみ通知（URL単位）
+        "index_extract": True,        # 一覧から個別記事リンクを抽出
+        "allow_external": False,      # 外部リンクは拾わない（kstcci内のみ）
     },
 }
 
-# === キーワード（タイトル/本文どちらかに含めばヒット） ===
+# === キーワード（タイトル/本文に含まれればヒット） ===
 KEYWORDS = ["補助金", "支援金", "講座"]
 
 DB = "shigaplaza.db"
@@ -45,7 +44,7 @@ SMTP_SENDER = os.getenv("SMTP_SENDER")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL", "57180928miwa@gmail.com")
 
-UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) MonitorBot/1.5"
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) MonitorBot/1.6"
 
 def init_db():
     con = sqlite3.connect(DB)
@@ -78,7 +77,6 @@ def norm_url(base, href):
     if not href:
         return ""
     u = urllib.parse.urljoin(base, href)
-    # mailto, tel, # は除外
     if u.startswith("mailto:") or u.startswith("tel:") or "#" in u:
         return ""
     return u
@@ -91,41 +89,39 @@ def any_match(patterns, path):
 
 def pick_articles_from_list(list_url, rule):
     """
-    通常: 同一ホスト内で detail_patterns にマッチ & exclude_patterns を除外して収集
-    kstcci: index_extract=True のとき、/news(/page/..)? は“一覧”扱いとして
-            a要素のテキストにキーワードが含まれる個別リンク（外部含む）を抽出
+    既定：同一ホスト内で detail_patterns に合うリンクを拾う。
+    kstcci は index_extract=True のため、/news（および /news/page/…）を“一覧”とみなし、
+    その中の個別記事リンク（/notice/postNNNN or /news/postNNNN）だけを抽出する。
     """
     host = host_of(list_url)
     soup = get_soup(list_url)
     links = set()
 
-    # --- kstcci の一覧抽出（/news, /news/page/.. もここで処理）
+    # --- kstcci の一覧抽出 ---
     if rule.get("index_extract", False) and host == "www.kstcci.or.jp":
         p = path_of(list_url)
+        # /news と /news/page/N ... を一覧とみなす
         if re.match(r"^/news(/page/\d+)?/?$", p):
             for a in soup.select("a[href]"):
-                text = a.get_text(" ", strip=True)
-                if not text:
+                u = norm_url(list_url, a.get("href"))
+                if not u:
                     continue
-                # アンカーテキストにキーワードを含むリンクだけ拾う（= 当該ニュースの個別URL）
-                if any(k in text for k in KEYWORDS):
-                    u = norm_url(list_url, a.get("href"))
-                    if not u:
-                        continue
-                    # 外部リンクも許可（pref.shiga.lg.jp 等）
-                    if (rule.get("allow_external", False) or same_host(u, host)):
-                        links.add(u)
+                if not same_host(u, host):
+                    continue
+                path = path_of(u).lower()
+                # 個別記事だけ拾う
+                if any_match(rule["detail_patterns"], path):
+                    links.add(u)
             picked = sorted(links)
             print(f"[DEBUG] kstcci index-extract: picked {len(picked)} links from {list_url}")
             return picked[:200]
 
-    # --- 通常の収集（同一ホスト内）
+    # --- 既定（shigaplaza 等） ---
     for a in soup.select("a[href]"):
         u = norm_url(list_url, a.get("href"))
         if not u:
             continue
         if not same_host(u, host):
-            # 外部は通常拾わない
             continue
         path = path_of(u).lower()
         if rule.get("exclude_patterns") and any_match(rule["exclude_patterns"], path):
@@ -153,7 +149,6 @@ def parse_detail(url):
     published = find_date("公開日")
     updated   = find_date("最終更新") or find_date("更新日")
     hit = any(k in title or k in text for k in KEYWORDS)
-
     return dict(url=url, title=title, published=published, updated=updated, hit=hit)
 
 def make_item_id(url, updated, published, rule):
@@ -184,7 +179,6 @@ def send_mail(subject: str, body: str):
     msg["From"] = f"サイト監視 <{SMTP_SENDER}>"
     msg["To"] = RECIPIENT_EMAIL
     msg.set_content(body)
-
     with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as s:
         s.ehlo(); s.starttls(); s.ehlo()
         s.login(SMTP_SENDER, SMTP_PASSWORD)
@@ -206,9 +200,8 @@ def sample_sent(host: str) -> bool:
     return ok
 
 def mark_sample_sent(host: str):
-    import datetime as _dt
     con = sqlite3.connect(DB)
-    con.execute("INSERT OR REPLACE INTO samples(host, sent_at) VALUES(?, ?)", (host, _dt.datetime.utcnow().isoformat()+"Z"))
+    con.execute("INSERT OR REPLACE INTO samples(host, sent_at) VALUES(?, ?)", (host, datetime.utcnow().isoformat()+"Z"))
     con.commit(); con.close()
 
 def date_key(published: str, updated: str):
@@ -240,7 +233,7 @@ def main():
     init_db()
     total_new = 0
 
-    # 1) （任意）既存の最新ヒット記事を各ホスト1通ずつテスト送信
+    # （任意）既存の最新ヒット記事を各ホスト1通ずつテスト送信
     if os.getenv("FORCE_SAMPLE","0").lower() in ("1","true","yes"):
         for host, rule in SITE_RULES.items():
             if sample_sent(host):
@@ -265,7 +258,7 @@ def main():
             mark_sample_sent(host)
             time.sleep(1)
 
-    # 2) 通常運転（新着のみ通知）
+    # 通常運転（新着のみ通知）
     for host, rule in SITE_RULES.items():
         is_seed = not host_seeded(host) and os.getenv("FORCE_SEED", "1") == "1"
         if is_seed:
@@ -302,6 +295,5 @@ def main():
         send_mail("【監視テスト】通知経路の確認", "新着0件でしたが、通知経路の確認メールです。")
 
     print(f"done. new={total_new}")
-
 if __name__ == "__main__":
     main()
