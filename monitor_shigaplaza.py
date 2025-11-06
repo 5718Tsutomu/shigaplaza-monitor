@@ -206,7 +206,7 @@ def main():
     # 1) 事前テスト送信（各ホスト1件だけ、既存の「最新」ヒット記事をメール）
     #    - 環境変数 FORCE_SAMPLE=1 のときだけ実行
     #    - 送信済みホストは samples テーブルでスキップ（重複防止）
-    if os.getenv("FORCE_SAMPLE", "0") == "1":
+    if os.getenv("FORCE_SAMPLE","0").lower() in ("1","true","yes"):
         for host, rule in SITE_RULES.items():
             if sample_sent(host):
                 print(f"[INFO] sample already sent for {host}")
