@@ -14,23 +14,22 @@ SITE_RULES = {
         ],
         "detail_patterns": [r"/news/"],
         "exclude_patterns": [],
-        "brand_new_only": False,      # ←従来どおり：更新も通知
+        # ★変更：更新では再通知しない（URLが新規の時だけ通知）
+        "brand_new_only": True,
         "index_extract": False,
         "allow_external": False,
-        "title_only": False,          # ←従来どおり：本文ヒットもOK
+        "title_only": False,  # 従来どおり：本文ヒットもOK
     },
     "www.kstcci.or.jp": {
-        # /news（＋/news/page/...）を一覧とみなし、そこから個別記事URLを抽出
         "list_urls": [
             "https://www.kstcci.or.jp/news/",
         ],
-        # 個別記事URLのパターン（例：/notice/post6799, /news/post6801 など）
         "detail_patterns": [r"^/(news|notice)/post\d+/?$"],
         "exclude_patterns": [],
-        "brand_new_only": True,       # 新規のみ通知（URL単位）
-        "index_extract": True,        # 一覧から個別記事リンクを抽出
-        "allow_external": False,      # 外部リンクは拾わない（kstcci内のみ）
-        "title_only": True,           # ★タイトルにキーワードを含む場合のみ通知
+        "brand_new_only": True,   # 新規URLのみ通知
+        "index_extract": True,    # /news 一覧から個別記事リンクを抽出
+        "allow_external": False,  # 同ドメインのみ
+        "title_only": True,       # タイトルにキーワードがある場合のみ
     },
 }
 
@@ -45,7 +44,7 @@ SMTP_SENDER = os.getenv("SMTP_SENDER")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL", "57180928miwa@gmail.com")
 
-UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) MonitorBot/1.7"
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) MonitorBot/1.8"
 
 def init_db():
     con = sqlite3.connect(DB)
@@ -89,20 +88,17 @@ def any_match(patterns, path):
     return any(re.search(p, path) for p in patterns)
 
 def pick_articles_from_list(list_url, rule):
-    """一覧ページから記事URLを抽出（kstcciは/news配下の一覧→個別記事URL抽出）。"""
     host = host_of(list_url)
     soup = get_soup(list_url)
     links = set()
 
-    # --- kstcci の一覧抽出 ---
+    # --- kstcci: /news 一覧から個別記事URL抽出 ---
     if rule.get("index_extract", False) and host == "www.kstcci.or.jp":
         p = path_of(list_url)
         if re.match(r"^/news(/page/\d+)?/?$", p):
             for a in soup.select("a[href]"):
                 u = norm_url(list_url, a.get("href"))
-                if not u:
-                    continue
-                if not same_host(u, host):
+                if not u or not same_host(u, host):
                     continue
                 path = path_of(u).lower()
                 if any_match(rule["detail_patterns"], path):
@@ -114,9 +110,7 @@ def pick_articles_from_list(list_url, rule):
     # --- 既定（shigaplaza 等） ---
     for a in soup.select("a[href]"):
         u = norm_url(list_url, a.get("href"))
-        if not u:
-            continue
-        if not same_host(u, host):
+        if not u or not same_host(u, host):
             continue
         path = path_of(u).lower()
         if rule.get("exclude_patterns") and any_match(rule["exclude_patterns"], path):
@@ -144,23 +138,32 @@ def parse_detail(url, rule):
     published = find_date("公開日")
     updated   = find_date("最終更新") or find_date("更新日")
 
-    # ★ヒット条件：サイトごとに切替
+    # サイト別ヒット条件
     if rule.get("title_only", False):
         hit = any(k in title for k in KEYWORDS)  # タイトルのみ
     else:
-        hit = any(k in title or k in text for k in KEYWORDS)  # タイトルor本文（従来）
+        hit = any(k in title or k in text for k in KEYWORDS)  # タイトル or 本文
 
     return dict(url=url, title=title, published=published, updated=updated, hit=hit)
 
 def make_item_id(url, updated, published, rule):
+    # brand_new_only=True の場合は URL で既読管理（更新では再通知しない）
     if rule.get("brand_new_only", False):
-        return sha(url)               # kstcci: URLベース（更新では再通知しない）
+        return sha(url)
     basis = url + "|" + (updated or published)
-    return sha(basis or url)          # shigaplaza: 更新も通知
+    return sha(basis or url)
 
 def known(item_id):
     con = sqlite3.connect(DB); cur = con.cursor()
     cur.execute("SELECT 1 FROM items WHERE id=?", (item_id,))
+    ok = cur.fetchone() is not None
+    con.close()
+    return ok
+
+# ★互換：過去に「更新ID方式」で保存していた既読も URL 単位で弾くため
+def known_by_url(url):
+    con = sqlite3.connect(DB); cur = con.cursor()
+    cur.execute("SELECT 1 FROM items WHERE url=?", (url,))
     ok = cur.fetchone() is not None
     con.close()
     return ok
@@ -272,7 +275,8 @@ def main():
                     if not d["hit"]:
                         continue
                     item_id = make_item_id(d["url"], d["updated"], d["published"], rule)
-                    if known(item_id):
+                    # ★brand_new_only=True のサイトでは URL 既読も弾く（互換）
+                    if known(item_id) or (rule.get("brand_new_only", False) and known_by_url(d["url"])):
                         continue
                     if is_seed:
                         save({"id": item_id, **d}, src)
