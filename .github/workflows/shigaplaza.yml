@@ -2,9 +2,14 @@ name: shigaplaza-monitor
 
 on:
   schedule:
-    - cron: "0,30 * * * *"    # 30分おき（UTC）/ JSTでは毎時:00 と :30
-    - cron: "12 0 1 * *"      # 毎月1日 00:12 UTC（JST 09:12）にハートビート
-  workflow_dispatch: {}
+    - cron: "0,30 * * * *"    # 30分おき（UTC）
+    - cron: "12 0 1 * *"      # 毎月1日 00:12 UTC (JST 09:12) ハートビート
+  workflow_dispatch:
+    inputs:
+      force_sample:
+        description: "Send ONE sample email per host from existing latest matching news?"
+        type: boolean
+        default: false
 
 jobs:
   run:
@@ -26,8 +31,8 @@ jobs:
       - name: Checkout state branch
         uses: actions/checkout@v4
         with:
-          ref: state
-          path: state
+            ref: state
+            path: state
 
       - name: Restore DB from state branch (if exists)
         run: |
@@ -38,7 +43,7 @@ jobs:
             echo "[info] no DB in state"
           fi
 
-      # 初回確認メールは monitor 側の FORCE_MAIL で送る
+      # 初回確認メールは既存の仕組みを維持
       - name: One-time confirmation marker -> set FORCE_MAIL=1
         run: |
           if [ ! -f state/CONFIRMED.txt ]; then
@@ -65,6 +70,8 @@ jobs:
         run: python monitor_shigaplaza.py
         env:
           FORCE_MAIL: ${{ env.FORCE_MAIL }}
+          # checkbox の真偽値（"true"/"false"）をそのまま渡す → スクリプト側で true/yes/1 判定
+          FORCE_SAMPLE: ${{ github.event.inputs.force_sample }}
 
       - name: Save DB back to state branch if changed
         run: |
@@ -92,4 +99,3 @@ jobs:
           git add HEARTBEAT.txt
           git commit -m "chore(state): monthly heartbeat" || true
           git push origin state
-          FORCE_SAMPLE: ${{ vars.FORCE_SAMPLE }}
