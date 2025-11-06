@@ -1,16 +1,36 @@
 # monitor_shigaplaza.py
-import os, re, hashlib, time, sqlite3, requests, smtplib
+import os, re, hashlib, time, sqlite3, requests, smtplib, urllib.parse
 from email.message import EmailMessage
 from bs4 import BeautifulSoup
 
-BASE = "https://www.shigaplaza.or.jp"
-LISTS = [
-    f"{BASE}/news/support/subsidy/",
-    f"{BASE}/service/support/subsidy/",
-    f"{BASE}/service/hojyokin-introduction/",
-]
-DB = "shigaplaza.db"
+# === 監視対象ドメインごとの抽出ルール ===
+SITE_RULES = {
+    "www.shigaplaza.or.jp": {
+        "list_urls": [
+            "https://www.shigaplaza.or.jp/news/support/subsidy/",
+            "https://www.shigaplaza.or.jp/service/support/subsidy/",
+            "https://www.shigaplaza.or.jp/service/hojyokin-introduction/",
+        ],
+        # 記事候補リンク（部分一致）
+        "detail_patterns": [r"/news/"],
+    },
+    "www.kstcci.or.jp": {
+        "list_urls": [
+            # 必要に応じて個別一覧URLを追加可能
+            "https://www.kstcci.or.jp/",
+        ],
+        # 記事候補リンク（部分一致・広め）
+        "detail_patterns": [
+            r"/news", r"/seminar", r"/event", r"/kouza", r"/info",
+            r"/subsidy", r"/support", r"/hojokin", r"/hojyokin", r"/oshirase",
+        ],
+    },
+}
+
+# === 通知判定用キーワード（タイトル/本文のどちらかに含まれれば通知） ===
 KEYWORDS = ["補助金", "支援金", "講座", "セミナー", "募集", "公募", "説明会"]
+
+DB = "shigaplaza.db"
 
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
@@ -18,7 +38,7 @@ SMTP_SENDER = os.getenv("SMTP_SENDER")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL", "57180928miwa@gmail.com")
 
-UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) MonitorBot/1.0"
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) MonitorBot/1.1"
 
 def init_db():
     con = sqlite3.connect(DB)
@@ -36,18 +56,38 @@ def get_soup(url):
     r.raise_for_status()
     return BeautifulSoup(r.text, "lxml")
 
-def pick_articles_from_list(url):
-    soup = get_soup(url)
+def same_host(url, host):
+    return urllib.parse.urlparse(url).netloc == host
+
+def norm_url(base, href):
+    href = (href or "").strip()
+    if not href:
+        return ""
+    u = urllib.parse.urljoin(base, href)
+    # mailto, tel, # 等は除外
+    if u.startswith("mailto:") or u.startswith("tel:") or "#" in u:
+        return ""
+    return u
+
+def pick_articles_from_list(list_url, host, patterns):
+    """
+    一覧URLを開き、同一ホスト内で patterns のいずれかを含むリンクを記事候補として返す。
+    """
+    soup = get_soup(list_url)
     links = set()
     for a in soup.select("a[href]"):
-        href = (a.get("href") or "").strip()
-        if not href:
+        u = norm_url(list_url, a.get("href"))
+        if not u:
             continue
-        if href.startswith("/news/") or "/news/" in href:
-            links.add(href if href.startswith("http") else BASE + href)
+        if not same_host(u, host):
+            continue
+        path = urllib.parse.urlparse(u).path.lower()
+        if any(re.search(p, path) for p in patterns):
+            links.add(u)
     links = sorted(links)
-    print(f"[DEBUG] picked {len(links)} links from {url}")
-    return links
+    print(f"[DEBUG] {host}: picked {len(links)} links from {list_url}")
+    # リストページがトップのとき等、リンクが多過ぎるのを防ぐ
+    return links[:200]
 
 def parse_detail(url):
     s = get_soup(url)
@@ -56,13 +96,19 @@ def parse_detail(url):
     text = s.get_text(" ", strip=True)
 
     def find_date(label):
-        m = re.search(label + r"\s*[:：]?\s*([0-9]{4}\.[01][0-9]\.[0-3][0-9])", text)
-        return m.group(1) if m else ""
+        # 例：「公開日：2024.05.01」「最終更新 2024/05/01」「2024年5月1日」等
+        m = re.search(label + r"\s*[:：]?\s*([0-9]{4}[./年][01]?\d[./月][0-3]?\d)", text)
+        if m:
+            raw = m.group(1).replace("年", ".").replace("月", ".").replace("日", "")
+            raw = raw.replace("/", ".")
+            return raw
+        return ""
 
     published = find_date("公開日")
-    updated   = find_date("最終更新日")
+    updated   = find_date("最終更新") or find_date("更新日")
     hit = any(k in title or k in text for k in KEYWORDS)
 
+    # URL + 更新日(なければ公開日) で一意IDを作る ⇒ 更新も新着扱い
     basis = url + "|" + (updated or published)
     item_id = sha(basis or url)
 
@@ -100,31 +146,35 @@ def main():
     print(f"[DEBUG] FORCE_MAIL={os.getenv('FORCE_MAIL')!r}")
     init_db()
     new_count = 0
-    for src in LISTS:
-        try:
-            for url in pick_articles_from_list(src):
-                d = parse_detail(url)
-                if not d["hit"]:
-                    continue
-                if known(d["id"]):
-                    continue
-                save(d, src); new_count += 1
-                subject = f"【滋賀プラザ】新着/更新: {d['title']}"
-                body = (
-                    f"タイトル：{d['title']}\n"
-                    f"公開日：{d['published'] or '—'} / 最終更新：{d['updated'] or '—'}\n"
-                    f"URL：{d['url']}\n"
-                    f"出所：{src}\n"
-                )
-                send_mail(subject, body)
-                time.sleep(1)
-            time.sleep(2)
-        except Exception as e:
-            send_mail("【滋賀プラザ】監視失敗", f"URL: {src}\nError: {e}")
-    # --- 初回（DBなし検知などでFORCE_MAIL=1）や手動強制時のテスト通知 ---
+
+    # 各ドメインごとに巡回
+    for host, rule in SITE_RULES.items():
+        for src in rule["list_urls"]:
+            try:
+                for url in pick_articles_from_list(src, host, rule["detail_patterns"]):
+                    d = parse_detail(url)
+                    if not d["hit"]:
+                        continue
+                    if known(d["id"]):
+                        continue
+                    save(d, src); new_count += 1
+                    subject = f"【入手】新着/更新: {d['title']}"
+                    body = (
+                        f"タイトル：{d['title']}\n"
+                        f"公開日：{d['published'] or '—'} / 最終更新：{d['updated'] or '—'}\n"
+                        f"URL：{d['url']}\n"
+                        f"出所：{src}\n"
+                    )
+                    send_mail(subject, body)
+                    time.sleep(1)  # 送信マナー
+                time.sleep(2)      # アクセスマナー
+            except Exception as e:
+                send_mail("【監視失敗】サイト取得エラー", f"HOST: {host}\nSRC: {src}\nError: {e}")
+
+    # FORCE_MAIL=1（初回など）は新着0でもテスト通知
     force = os.getenv("FORCE_MAIL", "0") == "1"
     if new_count == 0 and force:
-        send_mail("【滋賀プラザ】テスト通知", "新着0件でしたが、通知経路の確認メールです。")
+        send_mail("【監視テスト】通知経路の確認", "新着0件でしたが、通知経路の確認メールです。")
     print(f"done. new={new_count}")
 
 if __name__ == "__main__":

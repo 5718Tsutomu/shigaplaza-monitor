@@ -2,8 +2,8 @@ name: shigaplaza-monitor
 
 on:
   schedule:
-    - cron: "0,30 * * * *"    # 30分おき
-    - cron: "12 0 1 * *"      # 毎月1日 00:12 UTCにハートビート
+    - cron: "0,30 * * * *"    # 30分おき（UTC）/ JSTでは毎時:00 と :30
+    - cron: "12 0 1 * *"      # 毎月1日 00:12 UTC（JST 09:12）にハートビート
   workflow_dispatch: {}
 
 jobs:
