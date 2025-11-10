@@ -14,11 +14,11 @@ SITE_RULES = {
         ],
         "detail_patterns": [r"/news/"],
         "exclude_patterns": [],
-        # ★変更：更新では再通知しない（URLが新規の時だけ通知）
+        # 更新では再通知しない（URLが新規の時だけ通知）
         "brand_new_only": True,
         "index_extract": False,
         "allow_external": False,
-        "title_only": False,  # 従来どおり：本文ヒットもOK
+        "title_only": False,  # 本文ヒットもOK
     },
     "www.kstcci.or.jp": {
         "list_urls": [
@@ -44,7 +44,10 @@ SMTP_SENDER = os.getenv("SMTP_SENDER")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL", "57180928miwa@gmail.com")
 
-UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) MonitorBot/1.8"
+# ★エラー通知トグル：1/true/yes のときのみエラーをメール送信（デフォルトは送らない）
+ERROR_NOTIFY = os.getenv("ERROR_NOTIFY", "0").lower() in ("1", "true", "yes")
+
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) MonitorBot/1.9"
 
 def init_db():
     con = sqlite3.connect(DB)
@@ -160,7 +163,7 @@ def known(item_id):
     con.close()
     return ok
 
-# ★互換：過去に「更新ID方式」で保存していた既読も URL 単位で弾くため
+# 過去に「更新ID方式」で保存していた既読も URL 単位で弾くため
 def known_by_url(url):
     con = sqlite3.connect(DB); cur = con.cursor()
     cur.execute("SELECT 1 FROM items WHERE url=?", (url,))
@@ -187,6 +190,13 @@ def send_mail(subject: str, body: str):
         s.ehlo(); s.starttls(); s.ehlo()
         s.login(SMTP_SENDER, SMTP_PASSWORD)
         s.send_message(msg)
+
+def notify_error(title: str, body: str):
+    """エラー通知の送信（デフォルト無効）。環境変数 ERROR_NOTIFY=1 で有効化。"""
+    if ERROR_NOTIFY:
+        send_mail(title, body)
+    else:
+        print(f"[WARN] {title}\n{body}")
 
 def host_seeded(host: str) -> bool:
     prefix = f"https://{host}/"
@@ -226,14 +236,14 @@ def pick_latest_matching(host: str, rule: dict):
                     candidates.append((src, d))
             time.sleep(1)
         except Exception as e:
-            print(f"[WARN] pick_latest_matching error: {host} {src} {e}")
+            notify_error("【監視失敗】一覧取得エラー", f"HOST: {host}\nSRC: {src}\nError: {e}")
     if not candidates:
         return None
     candidates.sort(key=lambda t: (date_key(t[1]["published"], t[1]["updated"]), t[1]["url"]), reverse=True)
     return candidates[0]
 
 def main():
-    print(f"[DEBUG] FORCE_MAIL={os.getenv('FORCE_MAIL')!r}  FORCE_SAMPLE={os.getenv('FORCE_SAMPLE')!r}")
+    print(f"[DEBUG] FORCE_MAIL={os.getenv('FORCE_MAIL')!r}  FORCE_SAMPLE={os.getenv('FORCE_SAMPLE')!r}  ERROR_NOTIFY={ERROR_NOTIFY}")
     init_db()
     total_new = 0
 
@@ -275,7 +285,6 @@ def main():
                     if not d["hit"]:
                         continue
                     item_id = make_item_id(d["url"], d["updated"], d["published"], rule)
-                    # ★brand_new_only=True のサイトでは URL 既読も弾く（互換）
                     if known(item_id) or (rule.get("brand_new_only", False) and known_by_url(d["url"])):
                         continue
                     if is_seed:
@@ -294,7 +303,8 @@ def main():
                     time.sleep(1)
                 time.sleep(2)
             except Exception as e:
-                send_mail("【監視失敗】サイト取得エラー", f"HOST: {host}\nSRC: {src}\nError: {e}")
+                # ここでメールしない（ログに残す）。必要なら ERROR_NOTIFY=1 でメール可能。
+                notify_error("【監視失敗】サイト取得エラー", f"HOST: {host}\nSRC: {src}\nError: {e}")
 
     if total_new == 0 and os.getenv("FORCE_MAIL","0") == "1":
         send_mail("【監視テスト】通知経路の確認", "新着0件でしたが、通知経路の確認メールです。")
