@@ -4,8 +4,10 @@
 滋賀県内 監視スクリプト（メール通知）
 
 挙動:
-- 各サイトのニュース一覧をクロールし、「タイトルにキーワードを含む」記事を監視
-- そのサイトについてDBに既読が1件もない場合（=実質初回）は:
+- 各サイトの「ニュース一覧ページ」を入り口としてクロール
+- そこから同一ドメイン内のリンクをたどり、詳細ページを開いて
+  「タイトルにキーワードを含む」記事だけを候補にする
+- そのサイトについて DB に既読が1件もない場合（=実質初回）は:
     → そのサイトの既存ヒットの中から「最新らしい1件だけ」メール通知
     → その他のヒットは通知せず DB に既読登録のみ
 - 既読があるサイトは「新しいURLだけ」通知
@@ -32,7 +34,7 @@ SMTP_SENDER = os.getenv("SMTP_SENDER")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL")
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (+monitor-shiga/1.3)"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (+monitor-shiga/1.4)"}
 REQ_TIMEOUT = 20
 
 # 手動実行時に「各サイト1件ずつ既存最新も送る」かどうか（Actions から渡される）
@@ -40,38 +42,46 @@ SEED_LATEST = os.getenv("SEED_LATEST", "0") == "1"
 
 # ========= 監視ルール =========
 SITE_RULES = [
-    # 既存2サイト（キーワード更新後）
+    # 滋賀県産業支援プラザ
+    # → 「目的から探す→企業・補助金」「支援内容から探す→補助金」を絞り込んだ一覧URL
     {
         "name": "滋賀県産業支援プラザ",
-        "entrances": ["https://www.shigaplaza.or.jp/"],
+        "entrances": [
+            "https://www.shigaplaza.or.jp/?target=all&tax_purpose%5B%5D=5&tax_support%5B%5D=12&tax_reception=all&s="
+        ],
         "keywords": ["補助金", "支援金", "助成金", "講座", "セミナー"],
     },
+    # 草津商工会議所 → ニュース一覧ページ
     {
         "name": "草津商工会議所",
         "entrances": ["https://www.kstcci.or.jp/news"],
         "keywords": ["補助金", "支援金", "助成金", "講座", "セミナー"],
     },
-    # 追加5サイト
+    # 守山商工会議所 → トップから「新着更新情報」等へリンクされているニュース群
     {
         "name": "守山商工会議所",
         "entrances": ["https://moriyama-cci.or.jp/"],
         "keywords": ["補助金", "支援金", "助成金"],
     },
+    # 大津商工会議所 → 「補助金・助成金情報」ページ
     {
         "name": "大津商工会議所",
         "entrances": ["https://www.otsucci.or.jp/information/subsidy"],
         "keywords": ["補助金", "支援金", "助成金"],
     },
+    # 栗東商工会議所 → トップの「お知らせ・新着情報」エリアから辿れる記事
     {
         "name": "栗東商工会議所",
         "entrances": ["https://rittosci.com/"],
         "keywords": ["補助金", "支援金", "助成金"],
     },
+    # 野洲市商工会 → 「新着情報」ページ
     {
         "name": "野洲市商工会",
         "entrances": ["https://yasu-cci.or.jp/topics"],
         "keywords": ["補助金", "支援金", "助成金"],
     },
+    # 甲賀市商工会 → 「ニュース＆トピックス」ページ
     {
         "name": "甲賀市商工会",
         "entrances": ["http://www.koka-sci.jp/"],
@@ -173,6 +183,10 @@ def extract_date_guess(soup) -> str | None:
     return m.group(1) if m else None
 
 def collect_same_domain_links(base_url: str, html: str, limit=80) -> list[str]:
+    """
+    指定した「一覧ページ」を起点に、同一ドメイン内のリンクをゆるく収集。
+    その中から、後で「タイトル＋キーワード」で本文ページだけが残るようにする。
+    """
     soup = BeautifulSoup(html, "lxml")
     base_netloc = urlparse(base_url).netloc
     out = []
@@ -272,6 +286,7 @@ def crawl_rule(rule: dict) -> int:
                 d = parse_detail(link)
                 if not d:
                     continue
+                # ★ニュースの「タイトル」にキーワードを含むかで判定
                 if not title_hit(d["title"], keywords):
                     continue
 
@@ -312,7 +327,7 @@ def crawl_rule(rule: dict) -> int:
         candidates.sort(key=date_key, reverse=True)
         top = candidates[0]
 
-        # seedモードのときは、たとえ既にknownでも「テスト用に一度だけ」送る
+        # seedモードのときは、既にknownでも「テスト用に一度だけ」送る
         if force_initial or not known_by_url(top["url"]):
             subject = f"（初回）最新: {top['title'] or '(タイトル不明)'}"
             body = (
