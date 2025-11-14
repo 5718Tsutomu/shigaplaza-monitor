@@ -1,30 +1,117 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-滋賀県内 監視スクリプト（メール通知）
-
-挙動:
-- 各サイトの「ニュース一覧ページ」を入り口としてクロール
-- そこから同一ドメイン内のリンクをたどり、詳細ページを開いて
-  「タイトルにキーワードを含む」記事だけを候補にする
-- そのサイトについて DB に既読が1件もない場合（=実質初回）は:
-    → そのサイトの既存ヒットの中から「最新らしい1件だけ」メール通知
-    → その他のヒットは通知せず DB に既読登録のみ
-- 既読があるサイトは「新しいURLだけ」通知
-- 通知メールの「出所」はURLではなくサイト名文字列
-- SEED_LATEST=1 のとき:
-    → DBの有無に関わらず、全サイトを「初回扱い」にして
-       各サイトの最新ヒット1件だけ送信（テスト用）
-
-既読判定は URL ベース（SQLite）。
-例外時はメール送信せずログのみ。
-"""
-
-import os, re, time, hashlib, sqlite3, smtplib
+# monitor_shigaplaza.py
+import os, re, hashlib, time, sqlite3, requests, smtplib, urllib.parse
 from email.message import EmailMessage
-from urllib.parse import urljoin, urlparse
-import requests
 from bs4 import BeautifulSoup
+from datetime import datetime
+
+# === 監視対象（サイトごとの抽出ルール） ===
+# detail_patterns は「個別記事」を表すパスの正規表現。
+# 迷ったら r"^/.+"（ホーム以外すべて）でOK。キーワードヒットで最終フィルタします。
+SITE_RULES = {
+    # 滋賀県産業プラザ
+    "www.shigaplaza.or.jp": {
+        "list_urls": [
+            "https://www.shigaplaza.or.jp/news/support/subsidy/",
+            "https://www.shigaplaza.or.jp/service/support/subsidy/",
+            "https://www.shigaplaza.or.jp/service/hojyokin-introduction/",
+        ],
+        "detail_patterns": [r"/news/"],
+        "exclude_patterns": [],
+        "brand_new_only": True,
+        "index_extract": False,
+        "allow_external": False,
+        "title_only": False,
+    },
+    # 草津商工会議所
+    "www.kstcci.or.jp": {
+        "list_urls": [
+            "https://www.kstcci.or.jp/news/",
+        ],
+        "detail_patterns": [r"^/(news|notice)/post\d+/?$"],
+        "exclude_patterns": [],
+        "brand_new_only": True,
+        "index_extract": True,   # /news の一覧から個別記事URLを抽出
+        "allow_external": False,
+        "title_only": True,
+    },
+
+    # 追加：守山商工会議所（新着更新情報）
+    "moriyama-cci.or.jp": {
+        "list_urls": [
+            "https://moriyama-cci.or.jp/",
+        ],
+        # ホーム以外（サブページ）を対象。キーワードで最終フィルタ
+        "detail_patterns": [r"^/.+"],
+        "exclude_patterns": [],
+        "brand_new_only": True,
+        "index_extract": False,
+        "allow_external": False,
+        "title_only": False,
+    },
+
+    # 追加：大津商工会議所（補助金・助成金情報）
+    "www.otsucci.or.jp": {
+        "list_urls": [
+            "https://www.otsucci.or.jp/information/subsidy",
+        ],
+        # /information/subsidy 配下の詳細記事リンク想定
+        "detail_patterns": [r"^/information/subsidy/.+", r"^/.+\d{4}.+" , r"^/.+"],
+        "exclude_patterns": [],
+        "brand_new_only": True,
+        "index_extract": False,
+        "allow_external": False,
+        "title_only": False,
+    },
+
+    # 追加：栗東商工会議所（お知らせ・新着情報）
+    "rittosci.com": {
+        "list_urls": [
+            "https://rittosci.com/",
+        ],
+        "detail_patterns": [r"^/.+"],
+        "exclude_patterns": [],
+        "brand_new_only": True,
+        "index_extract": False,
+        "allow_external": False,
+        "title_only": False,
+    },
+
+    # 追加：野洲市商工会（新着情報）
+    "yasu-cci.or.jp": {
+        "list_urls": [
+            "https://yasu-cci.or.jp/topics",
+        ],
+        "detail_patterns": [r"^/topics/.+", r"^/.+"],
+        "exclude_patterns": [],
+        "brand_new_only": True,
+        "index_extract": False,
+        "allow_external": False,
+        "title_only": False,
+    },
+
+    # 追加：甲賀市商工会（ニュース＆トピックス）
+    "www.koka-sci.jp": {
+        "list_urls": [
+            "http://www.koka-sci.jp/",
+        ],
+        "detail_patterns": [r"^/.+"],
+        "exclude_patterns": [],
+        "brand_new_only": True,
+        "index_extract": False,
+        "allow_external": False,
+        "title_only": False,
+    },
+}
+
+# === キーワード（ホスト別上書き対応） ===
+# 既定（デフォルト）：他のサイト → 補助金 / 支援金 / 助成金
+KEYWORDS_DEFAULT = ["補助金", "支援金", "助成金"]
+
+# 指定の2サイトのみ拡張（滋賀県産業プラザ・草津商工会議所）
+HOST_KEYWORDS = {
+    "www.shigaplaza.or.jp": ["補助金", "支援金", "助成金", "講座", "セミナー"],
+    "www.kstcci.or.jp":     ["補助金", "支援金", "助成金", "講座", "セミナー"],
+}
 
 DB = "shigaplaza.db"
 
@@ -32,206 +119,147 @@ SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
 SMTP_SENDER = os.getenv("SMTP_SENDER")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
-RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL")
+RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL", "57180928miwa@gmail.com")
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (+monitor-shiga/1.4)"}
-REQ_TIMEOUT = 20
+# ★エラー通知トグル：1/true/yes でメール通知（デフォルトは送らない）
+ERROR_NOTIFY = os.getenv("ERROR_NOTIFY", "0").lower() in ("1", "true", "yes")
 
-# 手動実行時に「各サイト1件ずつ既存最新も送る」かどうか（Actions から渡される）
-SEED_LATEST = os.getenv("SEED_LATEST", "0") == "1"
+UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X) AppleWebKit/537.36 (KHTML, like Gecko) MonitorBot/1.10"
 
-# ========= 監視ルール =========
-SITE_RULES = [
-    # 滋賀県産業支援プラザ
-    # → 「目的から探す→企業・補助金」「支援内容から探す→補助金」を絞り込んだ一覧URL
-    {
-        "name": "滋賀県産業支援プラザ",
-        "entrances": [
-            "https://www.shigaplaza.or.jp/news"
-        ],
-        "keywords": ["補助金", "支援金", "助成金", "講座", "セミナー"],
-    },
-    # 草津商工会議所 → ニュース一覧ページ
-    {
-        "name": "草津商工会議所",
-        "entrances": ["https://www.kstcci.or.jp/news"],
-        "keywords": ["補助金", "支援金", "助成金", "講座", "セミナー"],
-    },
-    # 守山商工会議所 → トップから「新着更新情報」等へリンクされているニュース群
-    {
-        "name": "守山商工会議所",
-        "entrances": ["https://moriyama-cci.or.jp/"],
-        "keywords": ["補助金", "支援金", "助成金"],
-    },
-    # 大津商工会議所 → 「補助金・助成金情報」ページ
-    {
-        "name": "大津商工会議所",
-        "entrances": ["https://www.otsucci.or.jp/information/subsidy"],
-        "keywords": ["補助金", "支援金", "助成金"],
-    },
-    # 栗東商工会議所 → トップの「お知らせ・新着情報」エリアから辿れる記事
-    {
-        "name": "栗東商工会議所",
-        "entrances": ["https://rittosci.com/"],
-        "keywords": ["補助金", "支援金", "助成金"],
-    },
-    # 野洲市商工会 → 「新着情報」ページ
-    {
-        "name": "野洲市商工会",
-        "entrances": ["https://yasu-cci.or.jp/topics"],
-        "keywords": ["補助金", "支援金", "助成金"],
-    },
-    # 甲賀市商工会 → 「ニュース＆トピックス」ページ
-    {
-        "name": "甲賀市商工会",
-        "entrances": ["http://www.koka-sci.jp/"],
-        "keywords": ["補助金", "支援金", "助成金"],
-    },
-]
-
-# ========= DB =========
 def init_db():
-    """
-    - テーブルが無ければ新規作成
-    - 既にある場合は、足りないカラム(source, created_at)をALTER TABLEで追加
-    - 必要なインデックスを作成
-    """
     con = sqlite3.connect(DB)
-    cur = con.cursor()
-    # 1) テーブルなければ作る（新しい定義）
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS items (
-            id TEXT PRIMARY KEY,
-            url TEXT,
-            title TEXT,
-            published TEXT,
-            updated TEXT,
-            source TEXT,
-            created_at TEXT
-        )
-    """)
-    con.commit()
+    con.execute("""CREATE TABLE IF NOT EXISTS items(
+      id TEXT PRIMARY KEY,
+      url TEXT, title TEXT, published TEXT, updated TEXT, src TEXT, created_at TEXT
+    )""")
+    con.execute("""CREATE TABLE IF NOT EXISTS samples(
+      host TEXT PRIMARY KEY,
+      sent_at TEXT
+    )""")
+    con.commit(); con.close()
 
-    # 2) 既存テーブルのカラムを確認して、足りなければ追加
-    cur.execute("PRAGMA table_info(items)")
-    cols = [row[1] for row in cur.fetchall()]  # row[1] がカラム名
+def sha(s): 
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
-    if "source" not in cols:
-        cur.execute("ALTER TABLE items ADD COLUMN source TEXT")
-        con.commit()
-        print("[info] DB migrated: added column 'source'")
+def get_soup(url):
+    r = requests.get(url, timeout=25, headers={"User-Agent": UA})
+    r.raise_for_status()
+    return BeautifulSoup(r.text, "lxml")
 
-    if "created_at" not in cols:
-        cur.execute("ALTER TABLE items ADD COLUMN created_at TEXT")
-        con.commit()
-        print("[info] DB migrated: added column 'created_at'")
+def host_of(url):
+    return urllib.parse.urlparse(url).netloc
 
-    # 3) インデックス作成
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_items_url ON items(url)")
-    cur.execute("CREATE INDEX IF NOT EXISTS idx_items_source ON items(source)")
-    con.commit()
+def same_host(url, host):
+    return host_of(url) == host
+
+def norm_url(base, href):
+    href = (href or "").strip()
+    if not href:
+        return ""
+    u = urllib.parse.urljoin(base, href)
+    if u.startswith("mailto:") or u.startswith("tel:") or "#" in u:
+        return ""
+    return u
+
+def path_of(url):
+    return urllib.parse.urlparse(url).path or "/"
+
+def any_match(patterns, path):
+    return any(re.search(p, path) for p in patterns)
+
+def pick_articles_from_list(list_url, rule):
+    host = host_of(list_url)
+    soup = get_soup(list_url)
+    links = set()
+
+    # --- 既存：草津商工会議所（/news 一覧から個別記事URLを抽出） ---
+    if rule.get("index_extract", False) and host == "www.kstcci.or.jp":
+        p = path_of(list_url)
+        if re.match(r"^/news(/page/\d+)?/?$", p):
+            for a in soup.select("a[href]"):
+                u = norm_url(list_url, a.get("href"))
+                if not u or not same_host(u, host):
+                    continue
+                path = path_of(u).lower()
+                if any_match(rule["detail_patterns"], path):
+                    links.add(u)
+            picked = sorted(links)
+            print(f"[DEBUG] kstcci index-extract: picked {len(picked)} links from {list_url}")
+            return picked[:200]
+
+    # --- 汎用（同一ホストのリンクから detail_patterns に合致するもの） ---
+    for a in soup.select("a[href]"):
+        u = norm_url(list_url, a.get("href"))
+        if not u:
+            continue
+        if not rule.get("allow_external", False) and not same_host(u, host):
+            continue
+        path = path_of(u).lower()
+        if rule.get("exclude_patterns") and any_match(rule["exclude_patterns"], path):
+            continue
+        if any_match(rule["detail_patterns"], path):
+            links.add(u)
+
+    picked = sorted(links)
+    print(f"[DEBUG] {host}: picked {len(picked)} links from {list_url}")
+    return picked[:200]
+
+def parse_detail(url, rule):
+    s = get_soup(url)
+    t = s.select_one("h1")
+    title = (t.get_text(strip=True) if t else (s.title.get_text(strip=True) if s.title else url))
+    text = s.get_text(" ", strip=True)
+
+    def find_date(label):
+        m = re.search(label + r"\s*[:：]?\s*([0-9]{4}[./年][01]?\d[./月][0-3]?\d)", text)
+        if m:
+            raw = m.group(1).replace("年", ".").replace("月", ".").replace("日", "")
+            return raw.replace("/", ".")
+        return ""
+
+    published = find_date("公開日")
+    updated   = find_date("最終更新") or find_date("更新日")
+
+    # ホスト別キーワード
+    kw = HOST_KEYWORDS.get(host_of(url), KEYWORDS_DEFAULT)
+
+    # サイト別：タイトルのみ / 本文も対象
+    if rule.get("title_only", False):
+        hit = any(k in title for k in kw)
+    else:
+        hit = any(k in title or k in text for k in kw)
+
+    return dict(url=url, title=title, published=published, updated=updated, hit=hit)
+
+def make_item_id(url, updated, published, rule):
+    if rule.get("brand_new_only", False):
+        return sha(url)
+    basis = url + "|" + (updated or published)
+    return sha(basis or url)
+
+def known(item_id):
+    con = sqlite3.connect(DB); cur = con.cursor()
+    cur.execute("SELECT 1 FROM items WHERE id=?", (item_id,))
+    ok = cur.fetchone() is not None
     con.close()
+    return ok
 
-def known_by_url(url: str) -> bool:
+def known_by_url(url):
     con = sqlite3.connect(DB); cur = con.cursor()
     cur.execute("SELECT 1 FROM items WHERE url=?", (url,))
     ok = cur.fetchone() is not None
     con.close()
     return ok
 
-def site_has_any_seen(source_name: str) -> bool:
-    con = sqlite3.connect(DB); cur = con.cursor()
-    cur.execute("SELECT 1 FROM items WHERE source=? LIMIT 1", (source_name,))
-    ok = cur.fetchone() is not None
-    con.close()
-    return ok
-
-def save_item(item: dict):
+def save(item, src):
     con = sqlite3.connect(DB)
-    con.execute(
-        "INSERT OR IGNORE INTO items VALUES (?,?,?,?,?,?,datetime('now'))",
-        (item["id"], item["url"], item["title"], item.get("published"),
-         item.get("updated"), item["source"])
-    )
+    con.execute("INSERT OR IGNORE INTO items VALUES (?,?,?,?,?,?,datetime('now'))",
+                (item["id"], item["url"], item["title"], item["published"], item["updated"], src))
     con.commit(); con.close()
 
-# ========= HTTP / 解析 =========
-def http_get(url: str) -> str:
-    r = requests.get(url, headers=HEADERS, timeout=REQ_TIMEOUT)
-    r.raise_for_status()
-    r.encoding = r.apparent_encoding or r.encoding
-    return r.text
-
-def abs_url(base: str, href: str) -> str:
-    return urljoin(base, href)
-
-def sha(s: str) -> str:
-    return hashlib.sha1((s or "").encode("utf-8")).hexdigest()
-
-def extract_title(soup) -> str:
-    h1 = soup.find("h1")
-    if h1 and h1.get_text(strip=True):
-        return h1.get_text(strip=True)
-    if soup.title and soup.title.string:
-        return soup.title.string.strip()
-    h2 = soup.find("h2")
-    return h2.get_text(strip=True) if h2 else ""
-
-def extract_date_guess(soup) -> str | None:
-    txt = soup.get_text(" ", strip=True)
-    m = re.search(r"(20\d{2}[./-]\d{1,2}[./-]\d{1,2})", txt)
-    return m.group(1) if m else None
-
-def collect_same_domain_links(base_url: str, html: str, limit=80) -> list[str]:
-    """
-    指定した「一覧ページ」を起点に、同一ドメイン内のリンクをゆるく収集。
-    その中から、後で「タイトル＋キーワード」で本文ページだけが残るようにする。
-    """
-    soup = BeautifulSoup(html, "lxml")
-    base_netloc = urlparse(base_url).netloc
-    out = []
-    for a in soup.select("a[href]"):
-        href = a.get("href")
-        if not href:
-            continue
-        u = abs_url(base_url, href)
-        pu = urlparse(u)
-        if not pu.scheme.startswith("http"):
-            continue
-        if not pu.netloc.endswith(base_netloc):
-            continue
-        low = u.lower()
-        # 検索・タグページなどは軽く除外（強すぎると取りこぼすので控えめ）
-        if any(x in low for x in ["/?s=", "/search", "/tag/"]):
-            continue
-        out.append(u)
-        if len(out) >= limit:
-            break
-    # 重複除去（順保持）
-    seen = set(); uniq = []
-    for u in out:
-        if u not in seen:
-            uniq.append(u); seen.add(u)
-    return uniq
-
-def parse_detail(url: str) -> dict | None:
-    try:
-        html = http_get(url)
-    except Exception:
-        return None
-    soup = BeautifulSoup(html, "lxml")
-    title = extract_title(soup)
-    pub = extract_date_guess(soup)
-    return {"url": url, "title": title or "", "published": pub, "updated": None}
-
-def title_hit(title: str, keywords: list[str]) -> bool:
-    t = title or ""
-    return any(k in t for k in keywords)
-
-# ========= メール =========
 def send_mail(subject: str, body: str):
-    if not (SMTP_SENDER and SMTP_PASSWORD and RECIPIENT_EMAIL):
-        print("[warn] SMTP not set; skip mail")
+    if not (SMTP_SENDER and SMTP_PASSWORD):
+        print("SMTP env not set; skip email")
         return
     msg = EmailMessage()
     msg["Subject"] = subject
@@ -243,122 +271,122 @@ def send_mail(subject: str, body: str):
         s.login(SMTP_SENDER, SMTP_PASSWORD)
         s.send_message(msg)
 
-def save_known(item_like: dict, source_name: str):
-    save_item({
-        "id": sha(item_like["url"]),
-        "url": item_like["url"],
-        "title": item_like.get("title") or "",
-        "published": item_like.get("published"),
-        "updated": item_like.get("updated"),
-        "source": source_name,
-    })
+def notify_error(title: str, body: str):
+    if ERROR_NOTIFY:
+        send_mail(title, body)
+    else:
+        print(f"[WARN] {title}\n{body}")
 
-# ========= 監視本体 =========
-def crawl_rule(rule: dict) -> int:
-    """
-    通常運転:
-      - そのサイトに既読が1件以上ある & SEED_LATEST=0
-          → キーワードヒット & 未既読URLだけ通知
-      - それ以外（初回 or SEED_LATEST=1）
-          → キーワードヒット候補を集め、
-               * 最“新”と推定される1件だけ通知
-               * 他の候補は通知せず既読登録のみ
-    """
-    name = rule["name"]
-    entrances = rule["entrances"]
-    keywords = rule["keywords"]
+def host_seeded(host: str) -> bool:
+    prefix = f"https://{host}/"
+    con = sqlite3.connect(DB); cur = con.cursor()
+    cur.execute("SELECT 1 FROM items WHERE url LIKE ? OR src LIKE ? LIMIT 1", (prefix + "%", prefix + "%"))
+    ok = cur.fetchone() is not None
+    con.close()
+    return ok
 
-    already_seen_site = site_has_any_seen(name)
-    force_initial = SEED_LATEST   # 手動seed用フラグ
-    candidates = []               # 初回 or seed 時用
-    sent = 0
+def sample_sent(host: str) -> bool:
+    con = sqlite3.connect(DB); cur = con.cursor()
+    cur.execute("SELECT 1 FROM samples WHERE host=?", (host,))
+    ok = cur.fetchone() is not None
+    con.close()
+    return ok
 
-    for ent in entrances:
+def mark_sample_sent(host: str):
+    con = sqlite3.connect(DB)
+    con.execute("INSERT OR REPLACE INTO samples(host, sent_at) VALUES(?, ?)", (host, datetime.utcnow().isoformat()+"Z"))
+    con.commit(); con.close()
+
+def date_key(published: str, updated: str):
+    s = (updated or published or "").replace("/", ".")
+    try:
+        y, m, d = [int(x) for x in s.split(".")[:3]]
+        return (y, m, d)
+    except Exception:
+        return (0, 0, 0)
+
+def pick_latest_matching(host: str, rule: dict):
+    candidates = []
+    for src in rule["list_urls"]:
         try:
-            html = http_get(ent)
+            for url in pick_articles_from_list(src, rule):
+                d = parse_detail(url, rule)
+                if d["hit"]:
+                    candidates.append((src, d))
+            time.sleep(1)
         except Exception as e:
-            print(f"[warn] entrance get failed: {ent} ({e})")
-            continue
-
-        links = collect_same_domain_links(ent, html)
-        for link in links:
-            try:
-                d = parse_detail(link)
-                if not d:
-                    continue
-                # ★ニュースの「タイトル」にキーワードを含むかで判定
-                if not title_hit(d["title"], keywords):
-                    continue
-
-                # 通常運転：既読あり & seedモードでない → 新着のみ通知
-                if already_seen_site and not force_initial:
-                    if known_by_url(d["url"]):
-                        continue
-                    subject = f"新着: {d['title'] or '(タイトル不明)'}"
-                    body = (
-                        f"タイトル：{d['title'] or '—'}\n"
-                        f"公開日：{d['published'] or '—'}\n"
-                        f"URL：{d['url']}\n"
-                        f"出所：{name}\n"
-                    )
-                    send_mail(subject, body)
-                    save_known(d, name)
-                    sent += 1
-                    time.sleep(1)
-                else:
-                    # 初回 or seedモード: とりあえず候補として保持
-                    candidates.append(d)
-            except Exception as e:
-                print(f"[warn] detail parse failed: {link} ({e})")
-                continue
-        time.sleep(2)
-
-    # 初回 or seedモード: 候補から“最新”1件だけ通知し、残りは既読登録のみ
-    mode_initial = (not already_seen_site) or force_initial
-    if mode_initial and candidates:
-        def date_key(x):
-            p = x.get("published") or ""
-            pnum = re.sub(r"[^\d]", "", p)
-            try:
-                return int(pnum)
-            except Exception:
-                return -1
-
-        candidates.sort(key=date_key, reverse=True)
-        top = candidates[0]
-
-        # seedモードのときは、既にknownでも「テスト用に一度だけ」送る
-        if force_initial or not known_by_url(top["url"]):
-            subject = f"（初回）最新: {top['title'] or '(タイトル不明)'}"
-            body = (
-                f"タイトル：{top['title'] or '—'}\n"
-                f"公開日：{top['published'] or '—'}\n"
-                f"URL：{top['url']}\n"
-                f"出所：{name}\n"
-                + ("※初回/seed実行のため、このサイトの既存ヒットは通知せず既読登録のみ行いました。\n"
-                   if not already_seen_site else
-                   "※seed実行のため、このサイトの既存ヒットから最新1件のみテスト送信しました。\n")
-            )
-            send_mail(subject, body)
-            save_known(top, name)
-            sent += 1
-
-        # 残りは通知せず既読登録のみ（既にknownならスキップ）
-        for d in candidates[1:]:
-            if not known_by_url(d["url"]):
-                save_known(d, name)
-
-    return sent
+            notify_error("【監視失敗】一覧取得エラー", f"HOST: {host}\nSRC: {src}\nError: {e}")
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: (date_key(t[1]["published"], t[1]["updated"]), t[1]["url"]), reverse=True)
+    return candidates[0]
 
 def main():
+    print(f"[DEBUG] FORCE_MAIL={os.getenv('FORCE_MAIL')!r}  FORCE_SAMPLE={os.getenv('FORCE_SAMPLE')!r}  ERROR_NOTIFY={ERROR_NOTIFY}")
     init_db()
-    total = 0
-    for rule in SITE_RULES:
-        try:
-            total += crawl_rule(rule)
-        except Exception as e:
-            print(f"[warn] crawl failed: {rule['name']} ({e})")
-    print(f"done. notified={total}")
+    total_new = 0
 
+    # （任意）既存の最新ヒット記事を各ホスト1通ずつテスト送信
+    if os.getenv("FORCE_SAMPLE","0").lower() in ("1","true","yes"):
+        for host, rule in SITE_RULES.items():
+            if sample_sent(host):
+                print(f"[INFO] sample already sent for {host}")
+                continue
+            picked = pick_latest_matching(host, rule)
+            if picked is None:
+                print(f"[INFO] no matching article found for sample: {host}")
+                continue
+            src, d = picked
+            item_id = make_item_id(d["url"], d["updated"], d["published"], rule)
+            save({"id": item_id, **d}, src)
+            subject = f"【テスト送信（既存最新）】{d['title']}"
+            body = (
+                f"タイトル：{d['title']}\n"
+                f"公開日：{d['published'] or '—'} / 最終更新：{d['updated'] or '—'}\n"
+                f"URL：{d['url']}\n"
+                f"出所：{src}\n"
+                f"※これはテスト送信です（既存の中の最新1件）。今後は新着のみ通知します。"
+            )
+            send_mail(subject, body)
+            mark_sample_sent(host)
+            time.sleep(1)
+
+    # 通常運転（新着のみ通知）
+    for host, rule in SITE_RULES.items():
+        is_seed = not host_seeded(host) and os.getenv("FORCE_SEED", "1") == "1"
+        if is_seed:
+            print(f"[INFO] First-time silent seed for {host} (register existing items WITHOUT emailing)")
+
+        for src in rule["list_urls"]:
+            try:
+                for url in pick_articles_from_list(src, rule):
+                    d = parse_detail(url, rule)
+                    if not d["hit"]:
+                        continue
+                    item_id = make_item_id(d["url"], d["updated"], d["published"], rule)
+                    if known(item_id) or (rule.get("brand_new_only", False) and known_by_url(d["url"])):
+                        continue
+                    if is_seed:
+                        save({"id": item_id, **d}, src)
+                        continue
+                    save({"id": item_id, **d}, src)
+                    total_new += 1
+                    subject = f"【新着】{d['title']}"
+                    body = (
+                        f"タイトル：{d['title']}\n"
+                        f"公開日：{d['published'] or '—'} / 最終更新：{d['updated'] or '—'}\n"
+                        f"URL：{d['url']}\n"
+                        f"出所：{src}\n"
+                    )
+                    send_mail(subject, body)
+                    time.sleep(1)
+                time.sleep(2)
+            except Exception as e:
+                notify_error("【監視失敗】サイト取得エラー", f"HOST: {host}\nSRC: {src}\nError: {e}")
+
+    if total_new == 0 and os.getenv("FORCE_MAIL","0") == "1":
+        send_mail("【監視テスト】通知経路の確認", "新着0件でしたが、通知経路の確認メールです。")
+
+    print(f"done. new={total_new}")
 if __name__ == "__main__":
     main()
