@@ -47,7 +47,7 @@ SITE_RULES = [
     {
         "name": "滋賀県産業支援プラザ",
         "entrances": [
-            "https://www.shigaplaza.or.jp/?target=all&tax_purpose%5B%5D=5&tax_support%5B%5D=12&tax_reception=all&s="
+            "https://www.shigaplaza.or.jp/news"
         ],
         "keywords": ["補助金", "支援金", "助成金", "講座", "セミナー"],
     },
