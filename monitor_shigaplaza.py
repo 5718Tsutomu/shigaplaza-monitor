@@ -3,13 +3,16 @@
 """
 滋賀県内 監視スクリプト（メール通知）
 
-要件:
-- サイトごとに、ニュースの「タイトルにキーワードを含む」ものを監視
-- そのサイトでまだ1件も既読が無い場合（＝実質初回）は、
-    * そのサイトの「最新ヒット1件だけ」通知
-    * それ以外の既存ヒットは通知せず、DBに既読登録だけする
-- 2回目以降は「新しいURL」だけ通知
+挙動:
+- 各サイトのニュース一覧をクロールし、「タイトルにキーワードを含む」記事を監視
+- そのサイトについてDBに既読が1件もない場合（=実質初回）は:
+    → そのサイトの既存ヒットの中から「最新らしい1件だけ」メール通知
+    → その他のヒットは通知せず DB に既読登録のみ
+- 既読があるサイトは「新しいURLだけ」通知
 - 通知メールの「出所」はURLではなくサイト名文字列
+- SEED_LATEST=1 のとき:
+    → DBの有無に関わらず、全サイトを「初回扱い」にして
+       各サイトの最新ヒット1件だけ送信（テスト用）
 
 既読判定は URL ベース（SQLite）。
 例外時はメール送信せずログのみ。
@@ -29,12 +32,15 @@ SMTP_SENDER = os.getenv("SMTP_SENDER")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD")
 RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL")
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (+monitor-shiga/1.2)"}
+HEADERS = {"User-Agent": "Mozilla/5.0 (+monitor-shiga/1.3)"}
 REQ_TIMEOUT = 20
+
+# 手動実行時に「各サイト1件ずつ既存最新も送る」かどうか（Actions から渡される）
+SEED_LATEST = os.getenv("SEED_LATEST", "0") == "1"
 
 # ========= 監視ルール =========
 SITE_RULES = [
-    # 既存2サイト（キーワードのみ変更）
+    # 既存2サイト（キーワード更新後）
     {
         "name": "滋賀県産業支援プラザ",
         "entrances": ["https://www.shigaplaza.or.jp/"],
@@ -110,7 +116,7 @@ def init_db():
         con.commit()
         print("[info] DB migrated: added column 'created_at'")
 
-    # 3) インデックス作成（カラムは既に存在するのでOK）
+    # 3) インデックス作成
     cur.execute("CREATE INDEX IF NOT EXISTS idx_items_url ON items(url)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_items_source ON items(source)")
     con.commit()
@@ -152,10 +158,6 @@ def abs_url(base: str, href: str) -> str:
 def sha(s: str) -> str:
     return hashlib.sha1((s or "").encode("utf-8")).hexdigest()
 
-def norm_text(s: str) -> str:
-    if not s: return ""
-    return re.sub(r"\s+", " ", s).strip()
-
 def extract_title(soup) -> str:
     h1 = soup.find("h1")
     if h1 and h1.get_text(strip=True):
@@ -185,6 +187,7 @@ def collect_same_domain_links(base_url: str, html: str, limit=80) -> list[str]:
         if not pu.netloc.endswith(base_netloc):
             continue
         low = u.lower()
+        # 検索・タグページなどは軽く除外（強すぎると取りこぼすので控えめ）
         if any(x in low for x in ["/?s=", "/search", "/tag/"]):
             continue
         out.append(u)
@@ -240,17 +243,20 @@ def save_known(item_like: dict, source_name: str):
 def crawl_rule(rule: dict) -> int:
     """
     通常運転:
-      - そのサイトに既読が1件以上ある → キーワードヒット & 未既読URLだけ通知
-      - そのサイトに既読が0件（=実質初回） → キーワードヒット候補を集め、
-          * 最“新”と推定される1件だけ通知
-          * 他の候補は通知せず既読登録だけする
+      - そのサイトに既読が1件以上ある & SEED_LATEST=0
+          → キーワードヒット & 未既読URLだけ通知
+      - それ以外（初回 or SEED_LATEST=1）
+          → キーワードヒット候補を集め、
+               * 最“新”と推定される1件だけ通知
+               * 他の候補は通知せず既読登録のみ
     """
     name = rule["name"]
     entrances = rule["entrances"]
     keywords = rule["keywords"]
 
     already_seen_site = site_has_any_seen(name)
-    candidates = []  # 初回用
+    force_initial = SEED_LATEST   # 手動seed用フラグ
+    candidates = []               # 初回 or seed 時用
     sent = 0
 
     for ent in entrances:
@@ -269,8 +275,8 @@ def crawl_rule(rule: dict) -> int:
                 if not title_hit(d["title"], keywords):
                     continue
 
-                if already_seen_site:
-                    # 通常運転：未既読のみ通知
+                # 通常運転：既読あり & seedモードでない → 新着のみ通知
+                if already_seen_site and not force_initial:
                     if known_by_url(d["url"]):
                         continue
                     subject = f"新着: {d['title'] or '(タイトル不明)'}"
@@ -285,15 +291,16 @@ def crawl_rule(rule: dict) -> int:
                     sent += 1
                     time.sleep(1)
                 else:
-                    # 初回：候補として溜めておいて、後で1件だけ通知
+                    # 初回 or seedモード: とりあえず候補として保持
                     candidates.append(d)
             except Exception as e:
                 print(f"[warn] detail parse failed: {link} ({e})")
                 continue
         time.sleep(2)
 
-    # 初回：そのサイトの候補から“最新”を1件だけ通知し、残りは既読にする
-    if not already_seen_site and candidates:
+    # 初回 or seedモード: 候補から“最新”1件だけ通知し、残りは既読登録のみ
+    mode_initial = (not already_seen_site) or force_initial
+    if mode_initial and candidates:
         def date_key(x):
             p = x.get("published") or ""
             pnum = re.sub(r"[^\d]", "", p)
@@ -305,19 +312,23 @@ def crawl_rule(rule: dict) -> int:
         candidates.sort(key=date_key, reverse=True)
         top = candidates[0]
 
-        if not known_by_url(top["url"]):
+        # seedモードのときは、たとえ既にknownでも「テスト用に一度だけ」送る
+        if force_initial or not known_by_url(top["url"]):
             subject = f"（初回）最新: {top['title'] or '(タイトル不明)'}"
             body = (
                 f"タイトル：{top['title'] or '—'}\n"
                 f"公開日：{top['published'] or '—'}\n"
                 f"URL：{top['url']}\n"
                 f"出所：{name}\n"
-                "※初回のため、このサイトの既存ヒットは通知せず既読登録のみ行いました。\n"
+                + ("※初回/seed実行のため、このサイトの既存ヒットは通知せず既読登録のみ行いました。\n"
+                   if not already_seen_site else
+                   "※seed実行のため、このサイトの既存ヒットから最新1件のみテスト送信しました。\n")
             )
             send_mail(subject, body)
             save_known(top, name)
             sent += 1
 
+        # 残りは通知せず既読登録のみ（既にknownならスキップ）
         for d in candidates[1:]:
             if not known_by_url(d["url"]):
                 save_known(d, name)
