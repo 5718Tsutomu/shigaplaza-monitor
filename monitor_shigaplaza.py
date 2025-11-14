@@ -2,11 +2,14 @@
 # -*- coding: utf-8 -*-
 """
 滋賀県内 監視スクリプト（メール通知）
+
 要件:
-- 初回（サイトごとに既読が1件も無い状態）は「そのサイトの最新ヒット1件だけ通知」。
-  それ以外の既存ヒットは通知せずDBに既読登録だけして、以後は新着のみ通知。
-- ヒット判定は全サイト「タイトルにキーワードを含むか」のみ。
-- 通知本文の「出所」はURLではなくサイト名を表示。
+- サイトごとに、ニュースの「タイトルにキーワードを含む」ものを監視
+- そのサイトでまだ1件も既読が無い場合（＝実質初回）は、
+    * そのサイトの「最新ヒット1件だけ」通知
+    * それ以外の既存ヒットは通知せず、DBに既読登録だけする
+- 2回目以降は「新しいURL」だけ通知
+- 通知メールの「出所」はURLではなくサイト名文字列
 
 既読判定は URL ベース（SQLite）。
 例外時はメール送信せずログのみ。
@@ -31,7 +34,7 @@ REQ_TIMEOUT = 20
 
 # ========= 監視ルール =========
 SITE_RULES = [
-    # 既存2サイト（キーワード更新）
+    # 既存2サイト（キーワードのみ変更）
     {
         "name": "滋賀県産業支援プラザ",
         "entrances": ["https://www.shigaplaza.or.jp/"],
@@ -72,8 +75,15 @@ SITE_RULES = [
 
 # ========= DB =========
 def init_db():
+    """
+    - テーブルが無ければ新規作成
+    - 既にある場合は、足りないカラム(source, created_at)をALTER TABLEで追加
+    - 必要なインデックスを作成
+    """
     con = sqlite3.connect(DB)
-    con.execute("""
+    cur = con.cursor()
+    # 1) テーブルなければ作る（新しい定義）
+    cur.execute("""
         CREATE TABLE IF NOT EXISTS items (
             id TEXT PRIMARY KEY,
             url TEXT,
@@ -84,9 +94,27 @@ def init_db():
             created_at TEXT
         )
     """)
-    con.execute("CREATE INDEX IF NOT EXISTS idx_items_url ON items(url)")
-    con.execute("CREATE INDEX IF NOT EXISTS idx_items_source ON items(source)")
-    con.commit(); con.close()
+    con.commit()
+
+    # 2) 既存テーブルのカラムを確認して、足りなければ追加
+    cur.execute("PRAGMA table_info(items)")
+    cols = [row[1] for row in cur.fetchall()]  # row[1] がカラム名
+
+    if "source" not in cols:
+        cur.execute("ALTER TABLE items ADD COLUMN source TEXT")
+        con.commit()
+        print("[info] DB migrated: added column 'source'")
+
+    if "created_at" not in cols:
+        cur.execute("ALTER TABLE items ADD COLUMN created_at TEXT")
+        con.commit()
+        print("[info] DB migrated: added column 'created_at'")
+
+    # 3) インデックス作成（カラムは既に存在するのでOK）
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_items_url ON items(url)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_items_source ON items(source)")
+    con.commit()
+    con.close()
 
 def known_by_url(url: str) -> bool:
     con = sqlite3.connect(DB); cur = con.cursor()
@@ -148,19 +176,22 @@ def collect_same_domain_links(base_url: str, html: str, limit=80) -> list[str]:
     out = []
     for a in soup.select("a[href]"):
         href = a.get("href")
-        if not href: continue
+        if not href:
+            continue
         u = abs_url(base_url, href)
         pu = urlparse(u)
-        if not pu.scheme.startswith("http"): continue
-        if not pu.netloc.endswith(base_netloc): continue
+        if not pu.scheme.startswith("http"):
+            continue
+        if not pu.netloc.endswith(base_netloc):
+            continue
         low = u.lower()
-        # ページャ/検索など軽く除外（強すぎると取りこぼすため控えめに）
-        if any(x in low for x in ["/?s=","/search","/tag/"]):
+        if any(x in low for x in ["/?s=", "/search", "/tag/"]):
             continue
         out.append(u)
-        if len(out) >= limit: break
+        if len(out) >= limit:
+            break
     # 重複除去（順保持）
-    seen=set(); uniq=[]
+    seen = set(); uniq = []
     for u in out:
         if u not in seen:
             uniq.append(u); seen.add(u)
@@ -212,7 +243,7 @@ def crawl_rule(rule: dict) -> int:
       - そのサイトに既読が1件以上ある → キーワードヒット & 未既読URLだけ通知
       - そのサイトに既読が0件（=実質初回） → キーワードヒット候補を集め、
           * 最“新”と推定される1件だけ通知
-          * 他の候補は通知せず既読登録（将来の重複通知防止）
+          * 他の候補は通知せず既読登録だけする
     """
     name = rule["name"]
     entrances = rule["entrances"]
@@ -220,8 +251,8 @@ def crawl_rule(rule: dict) -> int:
 
     already_seen_site = site_has_any_seen(name)
     candidates = []  # 初回用
-
     sent = 0
+
     for ent in entrances:
         try:
             html = http_get(ent)
@@ -233,13 +264,13 @@ def crawl_rule(rule: dict) -> int:
         for link in links:
             try:
                 d = parse_detail(link)
-                if not d: 
+                if not d:
                     continue
                 if not title_hit(d["title"], keywords):
                     continue
 
                 if already_seen_site:
-                    # 既に既読がある通常運転：未既読のみ通知
+                    # 通常運転：未既読のみ通知
                     if known_by_url(d["url"]):
                         continue
                     subject = f"新着: {d['title'] or '(タイトル不明)'}"
@@ -254,25 +285,26 @@ def crawl_rule(rule: dict) -> int:
                     sent += 1
                     time.sleep(1)
                 else:
-                    # サイト初回：とりあえず候補として集める（後で1件だけ通知）
+                    # 初回：候補として溜めておいて、後で1件だけ通知
                     candidates.append(d)
             except Exception as e:
                 print(f"[warn] detail parse failed: {link} ({e})")
                 continue
         time.sleep(2)
 
-    # サイト初回処理：候補があれば「最新1件だけ通知」し、残りは既読登録のみ
+    # 初回：そのサイトの候補から“最新”を1件だけ通知し、残りは既読にする
     if not already_seen_site and candidates:
-        # published が拾えていれば降順、無ければ先頭優先
         def date_key(x):
             p = x.get("published") or ""
-            pnum = re.sub(r"[^\d]", "", p)  # 2025-01-02 -> 20250102
-            try: return int(pnum)
-            except: return -1
+            pnum = re.sub(r"[^\d]", "", p)
+            try:
+                return int(pnum)
+            except Exception:
+                return -1
+
         candidates.sort(key=date_key, reverse=True)
         top = candidates[0]
 
-        # 1件だけ通知
         if not known_by_url(top["url"]):
             subject = f"（初回）最新: {top['title'] or '(タイトル不明)'}"
             body = (
@@ -286,7 +318,6 @@ def crawl_rule(rule: dict) -> int:
             save_known(top, name)
             sent += 1
 
-        # 残りは通知せず既読登録のみ
         for d in candidates[1:]:
             if not known_by_url(d["url"]):
                 save_known(d, name)
