@@ -2,18 +2,15 @@ name: shigaplaza-monitor
 
 on:
   schedule:
-    - cron: "0,30 * * * *"    # 30分おき（UTC）
-    - cron: "12 0 1 * *"      # 毎月1日 00:12 UTC (JST 09:12) ハートビート
+    - cron: "0,30 * * * *"    # 30分おき
+    - cron: "12 0 1 * *"      # 毎月1日 00:12 UTC
   workflow_dispatch:
     inputs:
-      force_sample:
-        description: "Send ONE sample email per host from existing latest matching news?"
+      seed_latest:
+        description: "各サイトの既存“最新”を1件ずつテスト送信（1回限り）"
         type: boolean
         default: false
-      reset_samples:
-        description: "Reset 'sample sent' flags before run?"
-        type: boolean
-        default: false
+        required: false
 
 jobs:
   run:
@@ -26,6 +23,7 @@ jobs:
       SMTP_SENDER: ${{ secrets.SMTP_SENDER }}
       SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
       RECIPIENT_EMAIL: "57180928miwa@gmail.com"
+      SEED_LATEST: ${{ inputs.seed_latest && '1' || '0' }}   # ← 追加：手動実行時だけ 1
 
     steps:
       - name: Checkout code (main)
@@ -38,43 +36,13 @@ jobs:
           ref: state
           path: state
 
-      - name: Restore DB from state branch (if exists)
+      - name: Restore DB from state (if exists)
         run: |
           if [ -f state/shigaplaza.db ]; then
             cp state/shigaplaza.db ./shigaplaza.db
             echo "[info] restored DB from state"
           else
             echo "[info] no DB in state"
-          fi
-
-      - name: One-time confirmation marker -> set FORCE_MAIL=1 (first run only)
-        run: |
-          if [ ! -f state/CONFIRMED.txt ]; then
-            echo "FORCE_MAIL=1" >> "$GITHUB_ENV"
-            date -u +"%Y-%m-%dT%H:%M:%SZ" > state/CONFIRMED.txt
-            git -C state config user.name "github-actions[bot]"
-            git -C state config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git -C state add CONFIRMED.txt
-            git -C state commit -m "chore(state): add confirmation marker" || true
-            git -C state push origin state
-            echo "[info] set FORCE_MAIL=1 for first-run confirmation"
-          else
-            echo "[info] confirmation already sent (marker exists)"
-          fi
-
-      # ---- ここで “サンプル送信済みフラグ” をリセット可能（UIトグル） ----
-      - name: Reset sample flags (optional)
-        if: ${{ github.event.inputs.reset_samples == 'true' }}
-        run: |
-          sudo apt-get update && sudo apt-get install -y sqlite3
-          if [ -f ./shigaplaza.db ]; then
-            echo "[info] before reset:"
-            sqlite3 ./shigaplaza.db 'SELECT host, sent_at FROM samples;'
-            sqlite3 ./shigaplaza.db 'DELETE FROM samples;'
-            echo "[info] after reset:"
-            sqlite3 ./shigaplaza.db 'SELECT host, sent_at FROM samples;'
-          else
-            echo "[info] DB not found; nothing to reset"
           fi
 
       - name: Setup Python
@@ -86,11 +54,6 @@ jobs:
 
       - name: Run monitor
         run: python monitor_shigaplaza.py
-        env:
-          FORCE_MAIL: ${{ env.FORCE_MAIL }}
-          FORCE_SAMPLE: ${{ github.event.inputs.force_sample }}
-          # 必要なら大量送信テスト用に一時的に "0" にする（通常は触らない）
-          # FORCE_SEED: "0"
 
       - name: Save DB back to state branch if changed
         run: |
@@ -106,15 +69,3 @@ jobs:
               git push origin state
             fi
           fi
-
-      - name: Monthly heartbeat commit (only on 12 0 1 * * schedule)
-        if: github.event.schedule == '12 0 1 * *'
-        run: |
-          mkdir -p state
-          date -u +"%Y-%m-%dT%H:%M:%SZ" > state/HEARTBEAT.txt
-          cd state
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add HEARTBEAT.txt
-          git commit -m "chore(state): monthly heartbeat" || true
-          git push origin state
